@@ -31,7 +31,14 @@ previous close. Buttons choose the time frame: 1D, 5D, 1M, 6M, 1Y and 5Y (a coin
 because the service keeps two days of its minutes). The arrows beside the price step to the next and the
 previous symbol; Back returns to the list, and so does ninety seconds without a tap.
 
+**Reading the price at a time.** Put a finger on the chart and keep it there, sliding along. A cursor
+follows the finger and the header shows the price at that moment, its time, and its move since the
+frame began (since the previous close, on a day). A pre-market or after-hours moment is tagged as such.
+Lift the finger and the live price comes back.
+
 ![A day: pre-market and after-hours shaded, the previous close dashed](docs/chart-1D-post.png)
+
+![A finger held on the chart: the price at 10:50 and its move, read off the cursor](docs/chart-scrub.png)
 
 ![Five days, each with its pre-market and after-hours](docs/chart-5D.png)
 
@@ -113,6 +120,9 @@ tools/shot.sh chart:5D /tmp/chart.png     # sample: chart:1D, chart:1D:post, cha
 - A chart marks a stock's sessions by the exchange's clock, which the service sends with every bar.
 - Taps go to one transparent area over the screen and are read against the buttons that were on screen
   when the finger came down, so a screen that changes under a finger cannot press the wrong button.
+- The chart is a touch area of its own, and the Deck gives a finger to the smallest area it lands in, so a
+  finger held on the chart is followed there (even when it slides past the chart's edge) and never presses
+  a button. The sample screens can show a cursor: `tools/shot.sh chart:1D:post:43 out.png` puts it 43 % along.
 
 ## License
 

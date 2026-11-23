@@ -299,8 +299,10 @@ mod widget {
         // buttons, and only then are the new screen's buttons kept for the next taps.
         let tapped = STATE.with_borrow_mut(|s| {
             let changed = result.clicks.get("tap").is_some_and(|hit| s.on_tap(hit.x, hit.y));
+            // A finger held on the chart, wherever it has slid to (it may have left the chart's edge).
+            let scrubbed = s.set_scrub(result.drags.get("scrub").map(|hit| hit.x));
             s.hits = Some(hits);
-            changed
+            changed || scrubbed
         });
         if closed || tapped {
             sync_chart();

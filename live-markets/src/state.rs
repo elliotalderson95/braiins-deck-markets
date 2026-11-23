@@ -37,6 +37,16 @@ pub enum Health {
     Offline,
 }
 
+/// Where a finger held on the chart is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scrub {
+    /// This many pixels from the chart's left edge.
+    Px(f32),
+    /// This fraction of the plotting width: for the sample screens.
+    #[cfg_attr(not(feature = "preview"), allow(dead_code))]
+    Fraction(f32),
+}
+
 /// One symbol's chart.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Detail {
@@ -47,12 +57,14 @@ pub struct Detail {
     pub series: Option<Series>,
     /// The last attempt to load them failed.
     pub failed: bool,
+    /// A finger is down on the chart, reading the price at that time.
+    pub scrub: Option<Scrub>,
 }
 
 impl Detail {
     #[must_use]
     pub fn new(row: usize, frame: Frame) -> Self {
-        Self { row, frame, series: None, failed: false }
+        Self { row, frame, series: None, failed: false, scrub: None }
     }
 }
 
@@ -155,6 +167,21 @@ impl State {
                 _ => false,
             },
         }
+    }
+
+    /// A finger is on the chart at `x` pixels from its left edge, or has left it (`None`).
+    /// Whether that changed what is on show. A finger on the chart counts as a touch.
+    pub fn set_scrub(&mut self, x: Option<f32>) -> bool {
+        let Screen::Detail(d) = &mut self.screen else { return false };
+        let now = x.map(Scrub::Px);
+        if now.is_none() && matches!(d.scrub, Some(Scrub::Fraction(_))) {
+            // A cursor set for a sample screen stays until a finger comes.
+            return false;
+        }
+        if now.is_some() {
+            self.touched_ms = self.uptime_ms;
+        }
+        std::mem::replace(&mut d.scrub, now) != now
     }
 
     /// The chart to fetch: the symbol's query and kind, and the time frame; `None` on the list.
@@ -434,5 +461,31 @@ mod tests {
         s.screen = Screen::Detail(Detail::new(1, Frame::Day));
         s.set_entries(resolve_all(&["NVDA"]));
         assert_eq!(s.screen, Screen::List);
+    }
+
+    #[test]
+    fn a_finger_on_the_chart_is_tracked_until_it_leaves() {
+        let mut s = state(&["NVDA"]);
+        assert!(!s.set_scrub(Some(10.0)), "the list has no chart to read");
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        s.uptime_ms = 7_000;
+        assert!(s.set_scrub(Some(10.0)));
+        assert_eq!(s.touched_ms, 7_000, "a finger on the chart keeps it open");
+        assert!(!s.set_scrub(Some(10.0)), "the same place changes nothing");
+        assert!(s.set_scrub(Some(12.0)));
+        assert!(s.set_scrub(None));
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub.is_none()));
+        assert!(!s.set_scrub(None));
+    }
+
+    #[test]
+    fn changing_the_frame_lets_go_of_the_cursor() {
+        let mut s = state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail { scrub: Some(Scrub::Px(30.0)), ..Detail::new(0, Frame::Day) });
+        let layout = crate::view::detail_layout(1280.0, 480.0);
+        let r = layout.frames[1];
+        s.hits = Some(Hits::Detail(layout));
+        assert!(s.on_tap(r.x + 5.0, r.y + 5.0));
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub.is_none()));
     }
 }

@@ -7,12 +7,12 @@
 //! ```
 //!
 //! The values are `pre`, `post`, `closed`, `offline` for the list, and `chart:1D`, `chart:5D`,
-//! `chart:1M`, `chart:6M`, `chart:1Y`, `chart:5Y` (optionally `:post` or `:pre` after it) for
-//! the chart of the first symbol.
+//! `chart:1M`, `chart:6M`, `chart:1Y`, `chart:5Y` (optionally `:post` or `:pre` after it, and then
+//! `:50` for a finger half way along the chart) for the chart of the first symbol.
 
 use crate::chart::{Frame, RawBar, Series};
 use crate::quote::Raw;
-use crate::state::{Detail, Screen, State};
+use crate::state::{Detail, Screen, Scrub, State};
 use crate::symbols::Kind;
 
 const MODE: Option<&str> = option_env!("LM_PREVIEW");
@@ -136,6 +136,7 @@ pub fn seed(state: &mut State, now: i64) -> bool {
         let (kind, end) = (state.rows[0].entry.kind, SAMPLES[0].3);
         let mut detail = Detail::new(0, frame);
         detail.series = Some(series(frame, kind, end));
+        detail.scrub = mode.split(':').nth(3).and_then(|p| p.parse::<f32>().ok()).map(|p| Scrub::Fraction(p / 100.0));
         state.screen = Screen::Detail(detail);
         state.touched_ms = u64::MAX / 2;
     }

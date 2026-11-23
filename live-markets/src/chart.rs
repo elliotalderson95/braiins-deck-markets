@@ -210,6 +210,53 @@ impl Series {
     }
 }
 
+/// The plotted point nearest to `x` pixels along the plotting box; `line` is `Plot::line`, left to right.
+#[must_use]
+pub fn nearest(line: &[(f32, f32)], x: f32) -> Option<usize> {
+    if line.is_empty() {
+        return None;
+    }
+    let after = line.partition_point(|p| p.0 < x);
+    Some(if after == 0 {
+        0
+    } else if after >= line.len() {
+        line.len() - 1
+    } else if x - line[after - 1].0 <= line[after].0 - x {
+        after - 1
+    } else {
+        after
+    })
+}
+
+/// When a point was: the time and the session for minutes, the date for days.
+#[must_use]
+pub fn point_label(point: &Point, frame: Frame) -> String {
+    match frame {
+        Frame::Day | Frame::Week => {
+            let mut out = String::new();
+            if frame == Frame::Week {
+                out.push_str(WEEKDAYS[parts(point.local).weekday]);
+                out.push(' ');
+            }
+            out.push_str(&clock_label(point.local));
+            out.push_str(" ET");
+            match point.phase {
+                Phase::Pre => out.push_str(", pre-market"),
+                Phase::Post => out.push_str(", after hours"),
+                Phase::Regular => {}
+            }
+            out
+        }
+        Frame::Month => date_label(point.local),
+        _ => {
+            let mut out = date_label(point.local);
+            out.push_str(", ");
+            out.push_str(&year_label(point.local));
+            out
+        }
+    }
+}
+
 // ── Where things go ────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -671,5 +718,30 @@ mod tests {
         assert!((longer[2].close - 12.0).abs() < 1e-9);
         assert_eq!(longer[2].local, 1120);
         assert_eq!(series.with_live(None, 1_120_000, Phase::Regular).len(), 2);
+    }
+
+    #[test]
+    fn the_nearest_point_is_found_from_either_side() {
+        let line = [(0.0, 5.0), (10.0, 6.0), (30.0, 7.0), (31.0, 8.0)];
+        assert_eq!(nearest(&line, -20.0), Some(0));
+        assert_eq!(nearest(&line, 4.0), Some(0));
+        assert_eq!(nearest(&line, 6.0), Some(1));
+        assert_eq!(nearest(&line, 19.0), Some(1));
+        assert_eq!(nearest(&line, 21.0), Some(2));
+        assert_eq!(nearest(&line, 30.6), Some(3));
+        assert_eq!(nearest(&line, 500.0), Some(3));
+        assert_eq!(nearest(&[], 5.0), None);
+    }
+
+    #[test]
+    fn a_point_is_named_by_its_time_or_its_date() {
+        let day = 20_780 * DAY;
+        let at = |secs: i64, phase| Point { ms: 0, local: day + secs, close: 1.0, phase };
+        assert_eq!(point_label(&at(9 * HOUR + 41 * 60, Phase::Regular), Frame::Day), "09:41 ET");
+        assert_eq!(point_label(&at(5 * HOUR, Phase::Pre), Frame::Day), "05:00 ET, pre-market");
+        assert_eq!(point_label(&at(17 * HOUR + 5 * 60, Phase::Post), Frame::Week), "Mon 17:05 ET, after hours");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Month), "Nov 23");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Year), "Nov 23, 2026");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::FiveYears), "Nov 23, 2026");
     }
 }

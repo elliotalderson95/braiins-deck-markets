@@ -10,7 +10,7 @@ use bmc_wasm_sdk::*;
 use crate::chart::{self, Frame, Phase, Plot};
 use crate::format;
 use crate::quote::{Note, Quote, Session, Tag, View};
-use crate::state::{Detail, FLASH_MS, Health, Row, Screen, State};
+use crate::state::{Detail, FLASH_MS, Health, Row, Screen, Scrub, State};
 use crate::symbols::Kind;
 
 const BG: Color = Color::from_hex(0x0D_0F_13);
@@ -540,7 +540,8 @@ fn frame_button(r: Rect, label: &str, selected: bool, size: u32) -> Node {
 }
 
 /// The drawing commands of a chart, in a canvas `cw` by `ch` whose plotting box leaves room for the labels.
-fn chart_draws(plot: &Plot, kind: Kind, cw: f32, ch: f32, axis_w: f32, label_h: f32, size: u32) -> Vec<Draw> {
+#[expect(clippy::too_many_arguments, clippy::cast_precision_loss, reason = "the box, its margins, the type size and the cursor")]
+fn chart_draws(plot: &Plot, kind: Kind, cw: f32, ch: f32, axis_w: f32, label_h: f32, size: u32, cursor: Option<(usize, &str)>) -> Vec<Draw> {
     let (pw, ph) = (cw - axis_w, ch - label_h);
     let color = if plot.up { UP } else { DOWN };
     let mut draws = Vec::new();
@@ -549,7 +550,7 @@ fn chart_draws(plot: &Plot, kind: Kind, cw: f32, ch: f32, axis_w: f32, label_h: 
     for band in &plot.bands {
         draws.push(Draw::rect(band.x0, 0.0, (band.x1 - band.x0).max(0.0), ph, INK.with_alpha(0.05)));
         // Only a stretch as wide as a whole day's pre-market or after-hours gets its name, and only on a chart tall enough.
-        if band.x1 - band.x0 >= 120.0 && ph >= 160.0 {
+        if band.x1 - band.x0 >= 120.0 && ph >= 160.0 && cursor.is_none() {
             let (label, tint) = if band.phase == Phase::Pre { ("PRE", AMBER) } else { ("AFTER", VIOLET) };
             draws.push(Draw::text(
                 band.x0 + 8.0,
@@ -581,6 +582,30 @@ fn chart_draws(plot: &Plot, kind: Kind, cw: f32, ch: f32, axis_w: f32, label_h: 
         draws.push(Draw::path(plot.line.clone(), 3.0, color, false, Interpolation::Linear));
         draws.push(Draw::circle(last.0, last.1, 9.0, BG));
         draws.push(Draw::circle(last.0, last.1, 6.0, color));
+    }
+    // A finger on the chart: a line down to its time, a dot on the price, and the time above.
+    if let Some((i, label)) = cursor
+        && let Some(&(x, y)) = plot.line.get(i)
+    {
+        draws.push(Draw::path(vec![(x, 0.0), (x, ph)], 1.5, INK.with_alpha(0.6), false, Interpolation::Linear));
+        draws.push(Draw::circle(x, y, 12.0, BG));
+        draws.push(Draw::circle(x, y, 9.0, color));
+        draws.push(Draw::circle(x, y, 3.5, BG));
+        // Half the label's width, near enough to keep it inside the box.
+        let reach = label.len() as f32 * size as f32 * 0.3;
+        let (lx, align) = if x - reach < 0.0 {
+            (0.0, TextAlign::Left)
+        } else if x + reach > pw {
+            (pw, TextAlign::Right)
+        } else {
+            (x, TextAlign::Center)
+        };
+        draws.push(Draw::text(
+            lx,
+            16.0,
+            label,
+            style!(size: size + 1, weight: FontWeight::SEMIBOLD, color: INK, align: align, valign: VerticalAlign::Baseline, outline_color: BG, outline_width: 4.0),
+        ));
     }
     // Labels along the bottom.
     for tick in &plot.x_ticks {
@@ -634,12 +659,26 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         let reference = item.quote.as_ref().and_then(|q| q.prev_close);
         chart::plot(p, d.frame, kind, reference, rect.w - axis_w, rect.h - label_h)
     });
+    // A finger on the chart: the point it is over.
+    let scrub = d.scrub.zip(plot.as_ref()).and_then(|(s, p)| {
+        let pw = rect.w - axis_w;
+        let x = match s {
+            Scrub::Px(x) => x,
+            Scrub::Fraction(f) => f * pw,
+        }
+        .clamp(0.0, pw);
+        let i = chart::nearest(&p.line, x)?;
+        Some((i, *points.as_ref()?.get(i)?))
+    });
+    let scrub_label = scrub.map(|(_, p)| chart::point_label(&p, d.frame));
+    let cursor = scrub.map(|(i, _)| i).zip(scrub_label.as_deref());
     let draws = match (&plot, d.failed) {
-        (Some(p), _) => chart_draws(p, kind, rect.w, rect.h, axis_w, label_h, label_size),
+        (Some(p), _) => chart_draws(p, kind, rect.w, rect.h, axis_w, label_h, label_size, cursor),
         (None, true) => chart_message(rect.w, rect.h, "Chart unavailable"),
         (None, false) => chart_message(rect.w, rect.h, "Loading chart..."),
     };
-    let chart_node = canvas(props!(inset_left: rect.x, inset_top: rect.y, width: rect.w, height: rect.h), draws);
+    // The chart takes the finger itself: a touch area inside the screen's own wins, being the smaller.
+    let chart_node = touchable("scrub", props!(inset_left: rect.x, inset_top: rect.y, width: rect.w, height: rect.h), draws);
 
     // The move shown beside the price: the day's for a day, the whole frame's otherwise.
     let frame_move = points.as_ref().and_then(|p| match (p.first(), p.last()) {
@@ -647,6 +686,15 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         _ => None,
     });
     let pct = if d.frame == Frame::Day { view.and_then(|v| v.pct) } else { frame_move.or(view.and_then(|v| v.pct)) };
+    // Under a finger the header reads the price then, and its move from where the frame began.
+    let (shown_price, pct) = match scrub {
+        Some((_, p)) => {
+            let day_base = if d.frame == Frame::Day { item.quote.as_ref().and_then(|q| q.prev_close) } else { None };
+            let base = day_base.or_else(|| points.as_ref().and_then(|v| v.first()).map(|f| f.close));
+            (Some(p.close), base.filter(|b| *b != 0.0).map(|b| (p.close / b - 1.0) * 100.0))
+        }
+        None => (view.map(|v| v.price), pct),
+    };
     let (label_px, name_px, price_px, pill_px) = match class {
         DetailClass::Full => (34, 17, 40, 26),
         DetailClass::Medium => (28, 15, 30, 21),
@@ -667,16 +715,28 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
     }
 
     let mut title_head = vec![text(item.entry.label.clone(), style!(size: label_px, weight: FontWeight::BOLD, color: INK))];
-    if let Some(tag) = view.and_then(|v| v.tag) {
+    // The session of the price shown: of the point under a finger, else of the live one.
+    let shown_tag = match scrub {
+        Some((_, p)) => match p.phase {
+            Phase::Pre => Some(Tag::Pre),
+            Phase::Post => Some(Tag::After),
+            Phase::Regular => None,
+        },
+        None => view.and_then(|v| v.tag),
+    };
+    if let Some(tag) = shown_tag {
         // The word only where the header has room for it.
         title_head.push(if class == DetailClass::Full { tag_pill(tag, 13, false) } else { tag_dot(tag, false) });
     }
     let mut title = vec![row(props!(gap: 10.0, cross_align: CrossAlign::Center), title_head)];
-    if !compact
-        && let Some(name) = display_name(item) {
+    if !compact {
+        if let Some(label) = &scrub_label {
+            title.push(text(label.clone(), style!(size: name_px, weight: FontWeight::SEMIBOLD, color: INK, text_overflow: TextOverflow::Ellipsis, max_width: 360)));
+        } else if let Some(name) = display_name(item) {
             title.push(text(name, style!(size: name_px, color: MUTE, text_overflow: TextOverflow::Ellipsis, max_width: 360)));
         }
-    let price_text = view.map_or_else(|| "...".to_string(), |v| format::price(v.price, kind));
+    }
+    let price_text = shown_price.map_or_else(|| "...".to_string(), |p| format::price(p, kind));
     let (pill_text, pill_color) = match pct {
         Some(p) => (format::percent(p), tone(p)),
         None => (String::new(), DIM),
@@ -855,5 +915,32 @@ mod tests {
         assert!(l.prev.is_none() && l.next.is_none());
         let hits = Hits::Detail(l.clone());
         assert_eq!(resolve(&hits, l.back.x + 4.0, l.back.y + 4.0), Tap::Back);
+    }
+
+    #[test]
+    fn every_screen_builds_at_every_size_with_a_finger_on_the_chart() {
+        use crate::chart::{RawBar, Series};
+        use crate::symbols::resolve_all;
+
+        let mut state = State { interval_ms: 2_000, ..State::default() };
+        state.set_entries(resolve_all(&["NVDA", "TSLA"]));
+        let bars: Vec<RawBar> = (0..120)
+            .map(|i| RawBar { ms: i * 60_000, local: 20_780 * 86_400 + 4 * 3_600 + i * 60, close: 100.0 + (i as f64 / 7.0).sin() })
+            .collect();
+        for frame in Frame::ALL {
+            for (w, h) in [(1280, 480), (638, 480), (638, 238), (317, 238)] {
+                for finger in [None, Some(Scrub::Px(-40.0)), Some(Scrub::Px(123.0)), Some(Scrub::Px(5_000.0)), Some(Scrub::Fraction(0.5))] {
+                    let mut detail = Detail::new(0, frame);
+                    detail.series = Some(Series::from_bars(frame, Kind::Stock, &bars));
+                    detail.scrub = finger;
+                    state.screen = Screen::Detail(detail);
+                    let (_, hits) = screen(&state, w, h, 1_000);
+                    assert!(matches!(hits, Hits::Detail(_)), "{frame:?} {w}x{h}");
+                }
+                state.screen = Screen::List;
+                let (_, hits) = screen(&state, w, h, 1_000);
+                assert!(matches!(hits, Hits::List { .. }), "{w}x{h}");
+            }
+        }
     }
 }
