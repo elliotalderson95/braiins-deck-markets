@@ -291,6 +291,7 @@ mod widget {
         let (closed, tree, hits, animating) = STATE.with_borrow_mut(|s| {
             s.uptime_ms += u64::from(delta_ms.min(5_000));
             let closed = s.close_if_idle();
+            s.expire_scrub();
             let (tree, hits) = view::screen(s, vp.width, vp.height, now);
             (closed, tree, hits, s.flashing())
         });
@@ -299,8 +300,9 @@ mod widget {
         // buttons, and only then are the new screen's buttons kept for the next taps.
         let tapped = STATE.with_borrow_mut(|s| {
             let changed = result.clicks.get("tap").is_some_and(|hit| s.on_tap(hit.x, hit.y));
-            // A finger held on the chart, wherever it has slid to (it may have left the chart's edge).
-            let scrubbed = s.set_scrub(result.drags.get("scrub").map(|hit| hit.x));
+            // A finger on the chart, or one that touched it for less than a frame: the cursor goes there.
+            let touch = result.drags.get("scrub").or_else(|| result.clicks.get("scrub"));
+            let scrubbed = s.set_scrub(touch.map(|hit| hit.x));
             s.hits = Some(hits);
             changed || scrubbed
         });

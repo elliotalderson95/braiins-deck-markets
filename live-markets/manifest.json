@@ -1,7 +1,7 @@
 {
   "$schema": "../bmc-sdk/bmc-widget-manifest/manifest.schema.json",
   "uid": "6d57180e-ee7c-442b-ae4d-37db6f4b9e60",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "name": "Live Markets",
   "description": "Live prices for stocks, ETFs, indexes and crypto, with pre-market and after-hours moves.",
   "config_help": "Add up to 12 symbols, in the order you want them.\n\n**Stocks and ETFs:** `NVDA`, `AAPL`, `SPY`, `QQQ`, `BRK.B`\n\n**Crypto:** write pairs as `BTC-USD` or `ETH-USD`.\n\n**Indexes:** `^GSPC` (S&P 500), `^IXIC` (Nasdaq), `^DJI` (Dow Jones). Indexes have no pre-market or after-hours prices; for those moves use an ETF such as `SPY` or `QQQ`.\n\n**Gold:** `XAU-USD` (delayed).\n\nPre-market (4:00 to 9:30) and after-hours (16:00 to 20:00) moves show for US stocks and ETFs, in New York time. Prices come from CNBC's public quote service, which is not an official feed.",

@@ -9,6 +9,8 @@ use crate::view::{Hits, Tap, resolve};
 pub const FLASH_MS: u64 = 900;
 /// How long a chart stays up after the last tap before the list comes back.
 pub const DETAIL_IDLE_MS: u64 = 90_000;
+/// How long the cursor stays where a finger left it before the live price comes back.
+pub const SCRUB_HOLD_MS: u64 = 15_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tick {
@@ -57,14 +59,16 @@ pub struct Detail {
     pub series: Option<Series>,
     /// The last attempt to load them failed.
     pub failed: bool,
-    /// A finger is down on the chart, reading the price at that time.
+    /// The cursor: where a finger last touched the chart, and the price read there.
     pub scrub: Option<Scrub>,
+    /// `uptime_ms` of the last touch of the chart.
+    pub scrub_ms: u64,
 }
 
 impl Detail {
     #[must_use]
     pub fn new(row: usize, frame: Frame) -> Self {
-        Self { row, frame, series: None, failed: false, scrub: None }
+        Self { row, frame, series: None, failed: false, scrub: None, scrub_ms: 0 }
     }
 }
 
@@ -157,6 +161,10 @@ impl State {
                 }
                 _ => false,
             },
+            Tap::Live => match &mut self.screen {
+                Screen::Detail(d) => d.scrub.take().is_some(),
+                Screen::List => false,
+            },
             Tap::Step(delta) => match &mut self.screen {
                 Screen::Detail(d) if !self.rows.is_empty() => {
                     let n = self.rows.len() as isize;
@@ -169,19 +177,27 @@ impl State {
         }
     }
 
-    /// A finger is on the chart at `x` pixels from its left edge, or has left it (`None`).
-    /// Whether that changed what is on show. A finger on the chart counts as a touch.
+    /// A finger is on the chart at `x` pixels from its left edge (`None`: there is none). The cursor goes
+    /// there, and stays where the finger leaves it until `expire_scrub`, a tap on Live, or a change of
+    /// frame or symbol: the Deck turns any slide of more than a few pixels into a swipe of the scene, so
+    /// the chart is read by touching it, not by sliding along it. Whether the cursor moved.
     pub fn set_scrub(&mut self, x: Option<f32>) -> bool {
         let Screen::Detail(d) = &mut self.screen else { return false };
-        let now = x.map(Scrub::Px);
-        if now.is_none() && matches!(d.scrub, Some(Scrub::Fraction(_))) {
-            // A cursor set for a sample screen stays until a finger comes.
-            return false;
-        }
-        if now.is_some() {
-            self.touched_ms = self.uptime_ms;
-        }
+        let Some(x) = x else { return false };
+        self.touched_ms = self.uptime_ms;
+        d.scrub_ms = self.uptime_ms;
+        let now = Some(Scrub::Px(x));
         std::mem::replace(&mut d.scrub, now) != now
+    }
+
+    /// Lets the cursor go when nobody has touched the chart for a while. Whether it did.
+    pub fn expire_scrub(&mut self) -> bool {
+        let Screen::Detail(d) = &mut self.screen else { return false };
+        let held = matches!(d.scrub, Some(Scrub::Px(_))) && self.uptime_ms.saturating_sub(d.scrub_ms) >= SCRUB_HOLD_MS;
+        if held {
+            d.scrub = None;
+        }
+        held
     }
 
     /// The chart to fetch: the symbol's query and kind, and the time frame; `None` on the list.
@@ -464,18 +480,48 @@ mod tests {
     }
 
     #[test]
-    fn a_finger_on_the_chart_is_tracked_until_it_leaves() {
+    fn the_cursor_goes_where_a_finger_touches_and_stays_when_it_leaves() {
         let mut s = state(&["NVDA"]);
         assert!(!s.set_scrub(Some(10.0)), "the list has no chart to read");
         s.screen = Screen::Detail(Detail::new(0, Frame::Day));
         s.uptime_ms = 7_000;
         assert!(s.set_scrub(Some(10.0)));
-        assert_eq!(s.touched_ms, 7_000, "a finger on the chart keeps it open");
+        assert_eq!(s.touched_ms, 7_000, "a touch of the chart keeps it open");
         assert!(!s.set_scrub(Some(10.0)), "the same place changes nothing");
         assert!(s.set_scrub(Some(12.0)));
-        assert!(s.set_scrub(None));
+        assert!(!s.set_scrub(None), "a finger leaving is not a change");
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub == Some(Scrub::Px(12.0))));
+    }
+
+    #[test]
+    fn the_cursor_lets_go_after_a_while_but_not_a_sample_one() {
+        let mut s = state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        s.uptime_ms = 1_000;
+        s.set_scrub(Some(40.0));
+        s.uptime_ms = 1_000 + SCRUB_HOLD_MS - 1;
+        assert!(!s.expire_scrub());
+        s.uptime_ms += 1;
+        assert!(s.expire_scrub());
         assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub.is_none()));
-        assert!(!s.set_scrub(None));
+        assert!(!s.expire_scrub());
+        if let Screen::Detail(d) = &mut s.screen {
+            d.scrub = Some(Scrub::Fraction(0.5));
+        }
+        s.uptime_ms += 10 * SCRUB_HOLD_MS;
+        assert!(!s.expire_scrub(), "a cursor of a sample screen stays");
+    }
+
+    #[test]
+    fn the_live_button_lets_the_cursor_go() {
+        let mut s = state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail { scrub: Some(Scrub::Px(30.0)), ..Detail::new(0, Frame::Day) });
+        let mut layout = crate::view::detail_layout(1280.0, 480.0);
+        layout.live = Some(Rect::new(1000.0, 400.0, 150.0, 48.0));
+        s.hits = Some(Hits::Detail(layout));
+        assert!(s.on_tap(1050.0, 420.0));
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub.is_none()));
+        assert!(!s.on_tap(1050.0, 420.0), "nothing to let go of any more");
     }
 
     #[test]

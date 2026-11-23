@@ -74,6 +74,8 @@ pub struct DetailLayout {
     pub back: Rect,
     pub prev: Option<Rect>,
     pub next: Option<Rect>,
+    /// The button that lets the cursor go; there while the cursor is on the chart.
+    pub live: Option<Rect>,
     pub frames: [Rect; 6],
     /// The chart with its axis labels.
     pub chart: Rect,
@@ -120,6 +122,7 @@ pub fn detail_layout(w: f32, h: f32) -> DetailLayout {
         back,
         prev,
         next,
+        live: None,
         frames,
         chart,
         title_x: back.x + back.w + if class == DetailClass::Compact { 10.0 } else { 18.0 },
@@ -144,6 +147,8 @@ pub enum Tap {
     Frame(Frame),
     /// The previous (-1) or next (1) symbol.
     Step(isize),
+    /// Back to the live price, from the price the cursor reads.
+    Live,
 }
 
 #[must_use]
@@ -151,7 +156,9 @@ pub fn resolve(hits: &Hits, x: f32, y: f32) -> Tap {
     match hits {
         Hits::List { cells, first } => cells.iter().position(|c| c.contains(x, y)).map_or(Tap::Nothing, |i| Tap::Open(first + i)),
         Hits::Detail(d) => {
-            if d.back.contains(x, y) {
+            if d.live.is_some_and(|r| r.contains(x, y)) {
+                Tap::Live
+            } else if d.back.contains(x, y) {
                 Tap::Back
             } else if d.prev.is_some_and(|r| r.contains(x, y)) {
                 Tap::Step(-1)
@@ -634,7 +641,7 @@ fn chart_message(cw: f32, ch: f32, line: &str) -> Vec<Draw> {
 #[expect(clippy::cast_precision_loss, reason = "a screen size in pixels")]
 fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, Hits) {
     let (wf, hf) = (w as f32, h as f32);
-    let layout = detail_layout(wf, hf);
+    let mut layout = detail_layout(wf, hf);
     let item = &state.rows[d.row];
     let kind = item.entry.kind;
     let view = item.quote.as_ref().map(Quote::view);
@@ -767,16 +774,31 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
     for (r, frame) in layout.frames.iter().zip(Frame::ALL) {
         children.push(frame_button(*r, frame.label(kind), frame == d.frame, button_size));
     }
-    if class == DetailClass::Full
-        && let Some(p) = &points {
+    if class == DetailClass::Full {
+        let frame_row = layout.frames[0];
+        if scrub.is_some() {
+            // The cursor is on the chart: how to move it, and the button that lets it go.
+            let live = Rect::new(wf - layout.pad - 150.0, frame_row.y, 150.0, frame_row.h);
+            layout.live = Some(live);
+            children.push(button_box(
+                live,
+                UP.with_alpha(0.16),
+                vec![dot(UP), text("Live", style!(size: 20, weight: FontWeight::SEMIBOLD, color: UP))],
+            ));
+            children.push(row(
+                props!(inset_right: layout.pad + live.w + 18.0, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
+                [text("Touch the chart to read another time", style!(size: 17, color: MUTE))],
+            ));
+        } else if let Some(p) = &points {
             let lo = p.iter().map(|x| x.close).fold(f64::INFINITY, f64::min);
             let hi = p.iter().map(|x| x.close).fold(f64::NEG_INFINITY, f64::max);
             let line = join(&["Low ", &format::price(lo, kind), "   High ", &format::price(hi, kind)]);
             children.push(row(
-                props!(inset_right: layout.pad, inset_top: layout.frames[0].y, height: layout.frames[0].h, cross_align: CrossAlign::Center),
+                props!(inset_right: layout.pad, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
                 [text(line, style!(size: 17, color: MUTE))],
             ));
         }
+    }
     children.push(tap_area(wf, hf));
     (col(props!(width: wf, height: hf, background: BG), children), Hits::Detail(layout))
 }
@@ -942,5 +964,15 @@ mod tests {
                 assert!(matches!(hits, Hits::List { .. }), "{w}x{h}");
             }
         }
+    }
+
+    #[test]
+    fn the_live_button_is_pressed_before_anything_under_it() {
+        let mut l = detail_layout(1280.0, 480.0);
+        let live = Rect::new(1000.0, 400.0, 150.0, 48.0);
+        l.live = Some(live);
+        let hits = Hits::Detail(l);
+        assert_eq!(resolve(&hits, live.x + 10.0, live.y + 10.0), Tap::Live);
+        assert_eq!(resolve(&hits, 5.0, 5.0), Tap::Nothing);
     }
 }
