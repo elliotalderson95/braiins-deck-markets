@@ -9,6 +9,16 @@ use crate::view::{Hits, Tap, resolve};
 pub const FLASH_MS: u64 = 900;
 /// How long a chart stays up after the last tap before the list comes back.
 pub const DETAIL_IDLE_MS: u64 = 90_000;
+/// The cursor's speed under a held arrow, in widths of the chart per second: still for a moment, so
+/// that a tap is one notch, then slow and soon fast.
+fn jog_speed(held_ms: u64) -> f32 {
+    if held_ms < 350 {
+        return 0.0;
+    }
+    let ramp = ((held_ms - 350) as f32 / 1_500.0).min(1.0);
+    0.08 + 0.32 * ramp
+}
+
 /// How long the cursor stays where a finger left it before the live price comes back.
 pub const SCRUB_HOLD_MS: u64 = 15_000;
 
@@ -89,6 +99,9 @@ pub struct State {
     pub touched_ms: u64,
     /// The chart asked for in the request now in flight.
     pub requested: Option<(String, Frame)>,
+    /// The arrow held down (-1 left, 1 right), and for how long.
+    pub jog: Option<i8>,
+    pub jog_ms: u64,
     /// Milliseconds the widget has been drawn for: the clock of flashes and page turns.
     pub uptime_ms: u64,
     /// Unix time of the last good reply; 0 before the first.
@@ -188,6 +201,38 @@ impl State {
         d.scrub_ms = self.uptime_ms;
         let now = Some(Scrub::Px(x));
         std::mem::replace(&mut d.scrub, now) != now
+    }
+
+    /// An arrow of the chart is held (`held` is -1 or 1, or `None` when no arrow is), for `dt_ms` since
+    /// the last frame, over a plotting box `pw` wide. The cursor moves along the chart: a notch as the
+    /// finger comes down, then, past a short wait, faster the longer it is held. With no cursor yet it
+    /// starts from the right end, which is now. This is how the chart is swept without a slide, which
+    /// the Deck would take for a swipe of the scene. Whether anything changed on screen.
+    pub fn jog(&mut self, held: Option<i8>, dt_ms: u64, pw: f32) -> bool {
+        let Screen::Detail(d) = &mut self.screen else {
+            return std::mem::take(&mut self.jog).is_some();
+        };
+        let Some(dir) = held else {
+            self.jog_ms = 0;
+            return std::mem::take(&mut self.jog).is_some();
+        };
+        let first = self.jog != Some(dir);
+        if first {
+            self.jog = Some(dir);
+            self.jog_ms = 0;
+        } else {
+            self.jog_ms += dt_ms;
+        }
+        let from = match d.scrub {
+            Some(Scrub::Px(x)) => x,
+            Some(Scrub::Fraction(f)) => f * pw,
+            None => pw,
+        };
+        let step = if first { pw / 240.0 } else { jog_speed(self.jog_ms) * pw * dt_ms as f32 / 1_000.0 };
+        self.touched_ms = self.uptime_ms;
+        d.scrub_ms = self.uptime_ms;
+        d.scrub = Some(Scrub::Px((from + f32::from(dir) * step).clamp(0.0, pw)));
+        true
     }
 
     /// Lets the cursor go when nobody has touched the chart for a while. Whether it did.
@@ -533,5 +578,71 @@ mod tests {
         s.hits = Some(Hits::Detail(layout));
         assert!(s.on_tap(r.x + 5.0, r.y + 5.0));
         assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub.is_none()));
+    }
+
+    #[test]
+    fn an_arrow_moves_the_cursor_a_notch_then_sweeps_faster_the_longer_it_is_held() {
+        let mut s = state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        s.uptime_ms = 1_000;
+        let x = |s: &State| match &s.screen {
+            Screen::Detail(d) => match d.scrub {
+                Some(Scrub::Px(x)) => x,
+                _ => f32::NAN,
+            },
+            Screen::List => f32::NAN,
+        };
+        // No cursor yet: it starts at the right end, and a notch left of it is one point's width.
+        assert!(s.jog(Some(-1), 16, 1200.0));
+        assert!((x(&s) - (1200.0 - 5.0)).abs() < 0.01, "{}", x(&s));
+        // Held, but not for long: still.
+        assert!(s.jog(Some(-1), 100, 1200.0));
+        assert!((x(&s) - 1195.0).abs() < 0.01);
+        // Held on: it sweeps, and faster later.
+        for _ in 0..30 {
+            s.jog(Some(-1), 16, 1200.0);
+        }
+        let early = x(&s);
+        assert!(early < 1195.0 - 20.0, "it moved: {early}");
+        let before_fast = x(&s);
+        for _ in 0..60 {
+            s.jog(Some(-1), 16, 1200.0);
+        }
+        let slow_step = (1195.0 - early) / 30.0;
+        let fast_step = (before_fast - x(&s)) / 60.0;
+        assert!(fast_step > slow_step, "{fast_step} vs {slow_step}");
+        // Letting go ends the hold; the cursor stays.
+        let at = x(&s);
+        assert!(s.jog(None, 16, 1200.0), "the arrow's highlight goes");
+        assert!(!s.jog(None, 16, 1200.0));
+        assert_eq!(x(&s), at);
+        // The other way, from where it is.
+        assert!(s.jog(Some(1), 16, 1200.0));
+        assert!(x(&s) > at);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_the_ends_and_an_arrow_does_nothing_on_the_list() {
+        let mut s = state(&["NVDA"]);
+        assert!(!s.jog(Some(1), 16, 1200.0), "the list has no cursor");
+        s.screen = Screen::Detail(Detail { scrub: Some(Scrub::Px(2.0)), ..Detail::new(0, Frame::Day) });
+        for _ in 0..200 {
+            s.jog(Some(-1), 50, 1200.0);
+        }
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub == Some(Scrub::Px(0.0))));
+        for _ in 0..400 {
+            s.jog(Some(1), 50, 1200.0);
+        }
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub == Some(Scrub::Px(1200.0))));
+    }
+
+    #[test]
+    fn an_arrow_keeps_the_chart_and_its_cursor_open() {
+        let mut s = state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        s.uptime_ms = 40_000;
+        s.jog(Some(-1), 16, 1200.0);
+        assert_eq!(s.touched_ms, 40_000);
+        assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub_ms == 40_000));
     }
 }

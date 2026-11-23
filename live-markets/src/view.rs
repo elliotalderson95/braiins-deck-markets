@@ -76,12 +76,36 @@ pub struct DetailLayout {
     pub next: Option<Rect>,
     /// The button that lets the cursor go; there while the cursor is on the chart.
     pub live: Option<Rect>,
+    /// Arrows that hold the cursor in motion along the chart, in place of a slide the Deck would take for a swipe.
+    pub jog_left: Option<Rect>,
+    pub jog_right: Option<Rect>,
     pub frames: [Rect; 6],
     /// The chart with its axis labels.
     pub chart: Rect,
     /// Where the symbol's name starts, and where the price block must end.
     pub title_x: f32,
     pub price_edge: f32,
+}
+
+/// Width of the Live button and of one jog arrow on the full screen.
+const LIVE_W: f32 = 150.0;
+const JOG_W: f32 = 64.0;
+
+/// Room a chart leaves for its price labels (right) and its time labels (below).
+const fn chart_margins(class: DetailClass) -> (f32, f32) {
+    match class {
+        DetailClass::Full => (76.0, 30.0),
+        DetailClass::Medium => (66.0, 28.0),
+        DetailClass::Compact => (50.0, 22.0),
+    }
+}
+
+impl DetailLayout {
+    /// Width of the plotting box inside the chart, the span of the cursor.
+    #[must_use]
+    pub fn plot_w(&self) -> f32 {
+        self.chart.w - chart_margins(self.class).0
+    }
 }
 
 #[must_use]
@@ -115,6 +139,20 @@ pub fn detail_layout(w: f32, h: f32) -> DetailLayout {
     });
     let chart_y = pad + head_h + chart_gap;
     let chart = Rect::new(pad, chart_y, w - 2.0 * pad, (frames_y - chart_gap - chart_y).max(40.0));
+    let (axis_w, label_h) = chart_margins(class);
+    let (jog_left, jog_right) = match class {
+        // In the row of the buttons, left of Live.
+        DetailClass::Full => {
+            let right = Rect::new(w - pad - LIVE_W - 10.0 - JOG_W, frames_y, JOG_W, btn_h);
+            (Some(Rect::new(right.x - 10.0 - JOG_W, frames_y, JOG_W, btn_h)), Some(right))
+        }
+        // Over the foot of the chart, at its two ends.
+        DetailClass::Medium => {
+            let y = chart.y + chart.h - label_h - 8.0 - 40.0;
+            (Some(Rect::new(chart.x + 8.0, y, 56.0, 40.0)), Some(Rect::new(chart.x + chart.w - axis_w - 8.0 - 56.0, y, 56.0, 40.0)))
+        }
+        DetailClass::Compact => (None, None),
+    };
     DetailLayout {
         class,
         pad,
@@ -123,6 +161,8 @@ pub fn detail_layout(w: f32, h: f32) -> DetailLayout {
         prev,
         next,
         live: None,
+        jog_left,
+        jog_right,
         frames,
         chart,
         title_x: back.x + back.w + if class == DetailClass::Compact { 10.0 } else { 18.0 },
@@ -522,6 +562,17 @@ fn list_screen(state: &State, w: u32, h: u32, now: i64) -> (Node, Hits) {
 
 // ── A symbol's chart ───────────────────────────────────────────────
 
+/// A solid triangle pointing left or right in a box `w` by `h`, the sign of the arrows that move the cursor (the
+/// chevrons beside the price step to another symbol).
+fn triangle_draw(w: f32, h: f32, left: bool, color: Color) -> Draw {
+    let points = if left {
+        vec![(w * 0.64, h * 0.27), (w * 0.64, h * 0.73), (w * 0.34, h * 0.5)]
+    } else {
+        vec![(w * 0.36, h * 0.27), (w * 0.36, h * 0.73), (w * 0.66, h * 0.5)]
+    };
+    Draw::fill_path(points, color, false)
+}
+
 fn chevron(w: f32, h: f32, left: bool, color: Color) -> Node {
     let (near, far) = if left { (w * 0.7, w * 0.3) } else { (w * 0.3, w * 0.7) };
     canvas(
@@ -655,10 +706,11 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         Some(Tag::After) => Phase::Post,
         _ => Phase::Regular,
     };
-    let (axis_w, label_h, label_size) = match class {
-        DetailClass::Full => (76.0, 30.0, 16),
-        DetailClass::Medium => (66.0, 28.0, 15),
-        DetailClass::Compact => (50.0, 22.0, 12),
+    let (axis_w, label_h) = chart_margins(class);
+    let label_size = match class {
+        DetailClass::Full => 16,
+        DetailClass::Medium => 15,
+        DetailClass::Compact => 12,
     };
     let rect = layout.chart;
     let points = d.series.as_ref().map(|s| s.with_live(view.map(|v| v.price), now * 1_000, phase));
@@ -776,9 +828,10 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
     }
     if class == DetailClass::Full {
         let frame_row = layout.frames[0];
+        let text_edge = layout.jog_left.map_or(wf - layout.pad, |r| r.x - 18.0);
         if scrub.is_some() {
             // The cursor is on the chart: how to move it, and the button that lets it go.
-            let live = Rect::new(wf - layout.pad - 150.0, frame_row.y, 150.0, frame_row.h);
+            let live = Rect::new(wf - layout.pad - LIVE_W, frame_row.y, LIVE_W, frame_row.h);
             layout.live = Some(live);
             children.push(button_box(
                 live,
@@ -786,18 +839,28 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
                 vec![dot(UP), text("Live", style!(size: 20, weight: FontWeight::SEMIBOLD, color: UP))],
             ));
             children.push(row(
-                props!(inset_right: layout.pad + live.w + 18.0, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
-                [text("Touch the chart to read another time", style!(size: 17, color: MUTE))],
+                props!(inset_right: wf - text_edge, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
+                [text("Touch the chart, or hold an arrow", style!(size: 17, color: MUTE))],
             ));
         } else if let Some(p) = &points {
             let lo = p.iter().map(|x| x.close).fold(f64::INFINITY, f64::min);
             let hi = p.iter().map(|x| x.close).fold(f64::NEG_INFINITY, f64::max);
             let line = join(&["Low ", &format::price(lo, kind), "   High ", &format::price(hi, kind)]);
             children.push(row(
-                props!(inset_right: layout.pad, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
+                props!(inset_right: wf - text_edge, inset_top: frame_row.y, height: frame_row.h, cross_align: CrossAlign::Center),
                 [text(line, style!(size: 17, color: MUTE))],
             ));
         }
+    }
+    // The arrows: a touch area each, smaller than the chart or the screen, so they take the finger first.
+    for (r, key, left) in [(layout.jog_left, "jog_l", true), (layout.jog_right, "jog_r", false)] {
+        let Some(r) = r else { continue };
+        let held = state.jog == Some(if left { -1 } else { 1 });
+        children.push(touchable(
+            key,
+            props!(inset_left: r.x, inset_top: r.y, width: r.w, height: r.h, background: if held { INK.with_alpha(0.22) } else { CARD }, border_radius: 12.0),
+            [triangle_draw(r.w, r.h, left, INK)],
+        ));
     }
     children.push(tap_area(wf, hf));
     (col(props!(width: wf, height: hf, background: BG), children), Hits::Detail(layout))
@@ -909,6 +972,15 @@ mod tests {
                 assert!(pair[0].x + pair[0].w <= pair[1].x, "{w}x{h}: frame buttons overlap");
             }
             assert!(l.title_x < l.price_edge, "{w}x{h}: the title has room");
+            for r in [l.jog_left, l.jog_right].into_iter().flatten() {
+                assert!(r.x >= 0.0 && r.x + r.w <= w && r.y >= 0.0 && r.y + r.h <= h, "{w}x{h}: an arrow is on screen");
+            }
+            if l.class == DetailClass::Full {
+                let (a, b) = (l.jog_left.expect("BUG: arrows on the full screen"), l.jog_right.expect("BUG: arrows on the full screen"));
+                assert!(l.frames[5].x + l.frames[5].w < a.x && a.x + a.w <= b.x, "the arrows sit right of the frame buttons");
+                assert!(b.x + b.w <= w - l.pad - LIVE_W, "and left of Live");
+            }
+            assert!(l.plot_w() > 40.0);
         }
     }
 

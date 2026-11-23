@@ -32,7 +32,7 @@ mod widget {
     use crate::quote::{Raw, number};
     use crate::state::State;
     use crate::symbols::{Entry, Kind, resolve_all};
-    use crate::view;
+    use crate::view::{self, Hits};
 
     const QUOTE_URL: &str = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol";
     const QUOTE_OPTIONS: &str = "requestMethod=itv&noform=1&partnerId=2&exthrs=1&output=json";
@@ -298,13 +298,26 @@ mod widget {
         let result = render_ui(vp.width, vp.height, tree);
         // The taps came in on the screen drawn before this one, so they are read against its
         // buttons, and only then are the new screen's buttons kept for the next taps.
+        let mut jogging = false;
         let tapped = STATE.with_borrow_mut(|s| {
             let changed = result.clicks.get("tap").is_some_and(|hit| s.on_tap(hit.x, hit.y));
             // A finger on the chart, or one that touched it for less than a frame: the cursor goes there.
             let touch = result.drags.get("scrub").or_else(|| result.clicks.get("scrub"));
             let scrubbed = s.set_scrub(touch.map(|hit| hit.x));
+            // An arrow held, or tapped between two frames: the cursor moves along the chart.
+            let plot_w = if let Hits::Detail(layout) = &hits { layout.plot_w() } else { 0.0 };
+            let arrow = |map: &std::collections::HashMap<String, TouchHit>| {
+                [("jog_l", -1_i8), ("jog_r", 1)].into_iter().find(|(key, _)| map.contains_key(*key)).map(|(_, dir)| dir)
+            };
+            let held = arrow(&result.drags);
+            let jogged = match (held, arrow(&result.clicks)) {
+                (Some(dir), _) => s.jog(Some(dir), u64::from(delta_ms.min(100)), plot_w),
+                (None, Some(dir)) => s.jog(Some(dir), 0, plot_w) | s.jog(None, 0, plot_w),
+                (None, None) => s.jog(None, 0, plot_w),
+            };
+            jogging = held.is_some();
             s.hits = Some(hits);
-            changed || scrubbed
+            changed || scrubbed || jogged
         });
         if closed || tapped {
             sync_chart();
@@ -312,7 +325,7 @@ mod widget {
         if tapped {
             request_frame();
         }
-        // The clock behind page turns, flashes and the freshness light.
-        request_frame_after(if animating { 300 } else { 1_000 });
+        // The clock behind page turns, flashes and the freshness light; a held arrow wants every frame.
+        request_frame_after(if jogging { 16 } else if animating { 300 } else { 1_000 });
     }
 }

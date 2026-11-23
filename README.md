@@ -36,11 +36,17 @@ moment and stays there, and the header shows the price then, its time, and its m
 (since the previous close, on a day). Touch somewhere else to move it. The Live button, or fifteen seconds
 without a touch, brings the live price back. A pre-market or after-hours moment is tagged as such.
 
-Why touch and not slide? The Deck turns any horizontal slide of more than 15 pixels (under 2 mm on its
-screen) into a swipe to the next scene, cancels the widget's touch, and gives a widget no way to opt out:
+To sweep along the chart, **hold one of the two triangles** (bottom right on the full screen, over the foot
+of the chart on the half-height tile): the cursor moves a notch as the finger comes down, then runs along the
+chart, faster the longer it is held, and stops where you let go. The chevrons beside the price are different:
+they step to the next symbol.
+
+Why touch and hold, and not slide? The Deck turns any horizontal slide of more than 15 pixels (under 2 mm on
+its screen) into a swipe to the next scene, cancels the widget's touch, and gives a widget no way to opt out:
 it is decided in the firmware's compositor (`touch_gesture.rs` and `egl_compositor.rs` in `bmc-main`), and
 only a layout with a single scene, or a system overlay, switches it off. Sliding along the chart would
-therefore swipe the scene away, so the chart is read by touching it.
+therefore swipe the scene away. A widget that could claim a horizontal drag would need a change in the
+firmware; until then the chart is read by touching it and by holding the triangles.
 
 ![A day: pre-market and after-hours shaded, the previous close dashed](docs/chart-1D-post.png)
 
