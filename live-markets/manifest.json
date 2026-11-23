@@ -1,0 +1,47 @@
+{
+  "$schema": "../bmc-sdk/bmc-widget-manifest/manifest.schema.json",
+  "uid": "6d57180e-ee7c-442b-ae4d-37db6f4b9e60",
+  "version": "0.1.0",
+  "name": "Live Markets",
+  "description": "Live prices for stocks, ETFs, indexes and crypto, with pre-market and after-hours moves.",
+  "config_help": "Add up to 12 symbols, in the order you want them.\n\n**Stocks and ETFs:** `NVDA`, `AAPL`, `SPY`, `QQQ`, `BRK.B`\n\n**Crypto:** write pairs as `BTC-USD` or `ETH-USD`.\n\n**Indexes:** `^GSPC` (S&P 500), `^IXIC` (Nasdaq), `^DJI` (Dow Jones). Indexes have no pre-market or after-hours prices; for those moves use an ETF such as `SPY` or `QQQ`.\n\n**Gold:** `XAU-USD` (delayed).\n\nPre-market (4:00 to 9:30) and after-hours (16:00 to 20:00) moves show for US stocks and ETFs, in New York time. Prices come from CNBC's public quote service, which is not an official feed.",
+  "binary": "bin/live-markets",
+  "icon": "assets/icon.svg",
+  "category": "finance",
+  "settings": [],
+  "supported_viewports": [
+    {
+      "type": "rectangular",
+      "min_width": 317,
+      "max_width": 1280,
+      "min_height": 238,
+      "max_height": 480
+    }
+  ],
+  "params": {
+    "symbols": {
+      "name": "Symbols",
+      "description": "Stocks, ETFs, indexes and crypto pairs, in display order",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "placeholder": "e.g. NVDA, BTC-USD or ^GSPC"
+      },
+      "min_items": 1,
+      "max_items": 12,
+      "unique_items": true,
+      "default_value": ["NVDA", "TSLA", "MSTR", "META", "NFLX", "JPM", "SPY", "BTC-USD"]
+    },
+    "refresh_seconds": {
+      "name": "Update every",
+      "description": "How often prices are fetched while a market is open",
+      "type": "integer",
+      "min": 1,
+      "max": 60,
+      "step": 1,
+      "unit": "s",
+      "optional": true,
+      "default_value": 2
+    }
+  }
+}
