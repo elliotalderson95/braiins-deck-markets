@@ -1,10 +1,11 @@
 //! What the widget knows: the watchlist, the latest quote of each symbol, and how fresh they are.
 
-use crate::chart::{Frame, Series};
+use crate::chart::{self, Frame, Series};
 use crate::clock;
 use crate::hl::{self, Ctx};
 use crate::quote::{Quote, Raw, Session};
 use crate::symbols::{Entry, Kind, Source, request_list};
+use crate::tv::Reading;
 use crate::view::{Hits, Tap, resolve};
 
 /// How long a price flashes green or red after it ticks.
@@ -50,7 +51,13 @@ pub struct Row {
 impl Row {
     #[must_use]
     pub fn new(entry: Entry, prefer: Source) -> Self {
-        let source = if prefer == Source::Hyperliquid && !entry.hl.is_empty() { Source::Hyperliquid } else { Source::Cnbc };
+        let source = if entry.tv.is_some() {
+            Source::Tv
+        } else if prefer == Source::Hyperliquid && !entry.hl.is_empty() {
+            Source::Hyperliquid
+        } else {
+            Source::Cnbc
+        };
         Self { entry, quote: None, unknown: false, tick: None, prefer, source, coin: None, refused: Vec::new() }
     }
 
@@ -66,7 +73,7 @@ impl Row {
 
     /// Whether CNBC is asked for this symbol: it is the symbol's source, or Hyperliquid has gone quiet.
     fn asks_cnbc(&self, hl_down: bool) -> bool {
-        self.source == Source::Cnbc || hl_down
+        self.source == Source::Cnbc || (hl_down && self.source == Source::Hyperliquid)
     }
 }
 
@@ -190,6 +197,55 @@ impl State {
     #[must_use]
     pub fn needs_cnbc(&self) -> bool {
         self.rows.iter().any(|r| r.asks_cnbc(self.hl_down))
+    }
+
+    /// The TradingView tickers to ask the scanner for: the symbols that only it has.
+    #[must_use]
+    pub fn tv_tickers(&self) -> Vec<String> {
+        self.rows.iter().filter(|r| r.source == Source::Tv).filter_map(|r| r.entry.tv.clone()).collect()
+    }
+
+    /// Whether TradingView has anything to price.
+    #[must_use]
+    pub fn needs_tv(&self) -> bool {
+        self.rows.iter().any(|r| r.source == Source::Tv)
+    }
+
+    /// Whether TradingView prices something that moves all day, such as the VIX, and not only indicators that
+    /// are released once a month: how often to ask it.
+    #[must_use]
+    pub fn tv_trades(&self) -> bool {
+        self.rows.iter().any(|r| r.source == Source::Tv && r.entry.kind != Kind::Indicator)
+    }
+
+    /// Takes the scanner's answer: each of its symbols gets its quote, or is marked unknown when the scanner
+    /// left it out. A price that changed leaves a tick behind for the screen to flash.
+    pub fn apply_tv(&mut self, readings: &[Reading], now: i64) {
+        let uptime = self.uptime_ms;
+        for row in self.rows.iter_mut().filter(|r| r.source == Source::Tv) {
+            let reading = row.entry.tv.as_deref().and_then(|t| readings.iter().find(|r| r.ticker.eq_ignore_ascii_case(t)));
+            if let Some(reading) = reading {
+                let quote = Quote::from_tv(reading);
+                let shown = quote.view().price;
+                if let Some(before) = row.quote.as_ref().map(|q| q.view().price)
+                    && (shown - before).abs() > f64::EPSILON {
+                        row.tick = Some(Tick { up: shown > before, at_ms: uptime });
+                    }
+                row.quote = Some(quote);
+                row.unknown = false;
+            } else {
+                row.unknown = row.quote.is_none();
+            }
+        }
+        self.last_ok = now;
+    }
+
+    /// The TradingView ticker of the open chart's symbol, when TradingView is where its bars are from.
+    #[must_use]
+    pub fn chart_tv(&self) -> Option<String> {
+        let Screen::Detail(d) = &self.screen else { return None };
+        let row = self.rows.get(d.row)?;
+        if row.source == Source::Tv { row.entry.tv.clone() } else { None }
     }
 
     /// Whether Hyperliquid has anything to price.
@@ -326,7 +382,7 @@ impl State {
         let Some(hits) = &self.hits else { return false };
         match resolve(hits, x, y) {
             Tap::Open(i) if i < self.rows.len() => {
-                self.screen = Screen::Detail(Detail::new(i, Frame::Day));
+                self.screen = Screen::Detail(Detail::new(i, chart::default_frame(self.rows[i].kind())));
                 true
             }
             Tap::Nothing | Tap::Open(_) => false,
@@ -346,7 +402,7 @@ impl State {
                 Screen::Detail(d) if !self.rows.is_empty() => {
                     let n = self.rows.len() as isize;
                     let next = (d.row as isize + delta).rem_euclid(n) as usize;
-                    *d = Detail::new(next, d.frame);
+                    *d = Detail::new(next, chart::fit_frame(self.rows[next].kind(), d.frame));
                     true
                 }
                 _ => false,
@@ -457,7 +513,7 @@ impl State {
     /// Whether any symbol of CNBC's is trading now (pre-market, regular or after-hours): how often to ask it.
     #[must_use]
     pub fn any_trading(&self) -> bool {
-        self.rows.iter().filter_map(|r| r.quote.as_ref()).any(|q| !q.perp && q.session != Session::Closed)
+        self.rows.iter().filter_map(|r| r.quote.as_ref()).any(|q| !q.perp && !q.tv && q.session != Session::Closed)
     }
 
     /// The session that leads the header: that of the US stock market by the New York clock at `now`
@@ -465,7 +521,7 @@ impl State {
     /// perpetual trades round the clock and has none.
     #[must_use]
     pub fn market_session(&self, now: i64) -> Option<Session> {
-        let priced = |r: &&Row| matches!(r.entry.kind, Kind::Stock | Kind::Index) && r.quote.as_ref().is_some_and(|q| !q.perp);
+        let priced = |r: &&Row| matches!(r.entry.kind, Kind::Stock | Kind::Index) && r.quote.as_ref().is_some_and(|q| !q.perp && !q.tv);
         self.rows.iter().find(priced).map(|_| clock::us_session(now))
     }
 
@@ -1021,5 +1077,79 @@ mod tests {
         let mut coins = state(&["BTC-USD"]);
         coins.apply(&[raw("BTC.CM=", "60000")], 1000);
         assert_eq!(coins.market_session(1_795_000_000), None);
+    }
+
+    // ── TradingView ─────────────────────────────────────────────────
+
+    fn reading(ticker: &str, close: f64, change_abs: f64, economic: bool) -> Reading {
+        Reading {
+            ticker: ticker.into(),
+            description: "United States ISM Purchasing Managers Index (PMI)".into(),
+            close,
+            change_pct: 0.0,
+            change_abs,
+            time: 1_793_404_800,
+            economic,
+            delayed: false,
+        }
+    }
+
+    #[test]
+    fn indicators_and_the_vix_are_priced_by_tradingview_alone() {
+        let mut s = hl_state(&["ISM", "VIX", "NVDA", "JPM"]);
+        let sources: Vec<Source> = s.rows.iter().map(|r| r.source).collect();
+        assert_eq!(sources, [Source::Tv, Source::Tv, Source::Hyperliquid, Source::Hyperliquid]);
+        assert_eq!(s.tv_tickers(), ["ECONOMICS:USBCOI", "TVC:VIX"]);
+        assert!(s.needs_tv() && s.tv_trades());
+        // Neither Hyperliquid's silence nor CNBC's list touch them.
+        s.hl_down = true;
+        assert_eq!(s.request_list(), "NVDA%7CJPM");
+        assert_eq!(s.hl_coins(), ["NVDA", "xyz:NVDA", "JPM", "xyz:JPM"]);
+        assert!(!hl_state(&["ISM", "CPI"]).tv_trades(), "indicators change once a month");
+        assert!(!hl_state(&["NVDA"]).needs_tv());
+    }
+
+    #[test]
+    fn a_reading_gives_an_indicator_its_quote_and_a_missing_one_means_no_data() {
+        let mut s = hl_state(&["ISM", "economics:nosuch"]);
+        s.apply_tv(&[reading("ECONOMICS:USBCOI", 55.5, 1.0, true)], 1_000);
+        let q = s.rows[0].quote.as_ref().expect("BUG: a quote");
+        assert!((q.last - 55.5).abs() < 1e-9 && q.indicator);
+        assert_eq!(s.rows[0].kind(), Kind::Indicator);
+        assert!(!s.rows[0].unknown && s.rows[1].unknown && s.rows[1].quote.is_none());
+        assert_eq!(s.last_ok, 1_000);
+        // An answer that leaves out a symbol that had a quote keeps it.
+        s.apply_tv(&[], 1_001);
+        assert!(s.rows[0].quote.is_some() && !s.rows[0].unknown);
+        assert!(s.market_session(1_795_000_000).is_none(), "an indicator names no market session");
+        assert!(!s.any_trading());
+    }
+
+    #[test]
+    fn the_vix_ticks_like_a_price_does() {
+        let mut s = hl_state(&["VIX"]);
+        s.apply_tv(&[reading("TVC:VIX", 28.0, 1.0, false)], 1);
+        s.uptime_ms = 3_000;
+        s.apply_tv(&[reading("tvc:vix", 28.5, 1.5, false)], 2);
+        assert_eq!(s.rows[0].tick, Some(Tick { up: true, at_ms: 3_000 }));
+        assert_eq!(s.chart_tv(), None, "no chart is open");
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        assert_eq!(s.chart_tv().as_deref(), Some("TVC:VIX"));
+    }
+
+    #[test]
+    fn an_indicator_opens_on_a_year_and_a_step_keeps_a_frame_the_next_symbol_has() {
+        let mut s = hl_state(&["ISM", "NVDA", "CPI"]);
+        s.hits = Some(Hits::List { cells: (0..3).map(|k| crate::view::Rect::new(0.0, 60.0 * k as f32, 100.0, 50.0)).collect(), first: 0 });
+        assert!(s.on_tap(50.0, 10.0));
+        assert_eq!(s.screen, Screen::Detail(Detail::new(0, Frame::Year)));
+        let layout = crate::view::detail_layout(1280.0, 480.0);
+        let next = layout.next.expect("BUG: arrows");
+        s.hits = Some(Hits::Detail(layout));
+        assert!(s.on_tap(next.x + 5.0, next.y + 5.0));
+        assert_eq!(s.screen, Screen::Detail(Detail::new(1, Frame::Year)), "a stock has a year too");
+        s.screen = Screen::Detail(Detail::new(1, Frame::Week));
+        assert!(s.on_tap(next.x + 5.0, next.y + 5.0));
+        assert_eq!(s.screen, Screen::Detail(Detail::new(2, Frame::Year)), "an indicator has no 5D");
     }
 }

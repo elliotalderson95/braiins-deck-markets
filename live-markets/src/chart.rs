@@ -86,6 +86,26 @@ impl Frame {
     }
 }
 
+/// The time frames a kind of symbol has bars for: an indicator is released once a month or less often,
+/// so it has months and years.
+#[must_use]
+pub fn frames_for(kind: Kind) -> &'static [Frame] {
+    const MONTHLY: [Frame; 3] = [Frame::HalfYear, Frame::Year, Frame::FiveYears];
+    if kind == Kind::Indicator { &MONTHLY } else { &Frame::ALL }
+}
+
+/// The time frame a symbol opens on: a day, and for an indicator a year.
+#[must_use]
+pub fn default_frame(kind: Kind) -> Frame {
+    if kind == Kind::Indicator { Frame::Year } else { Frame::Day }
+}
+
+/// `frame` when the kind has it, else the one it opens on.
+#[must_use]
+pub fn fit_frame(kind: Kind, frame: Frame) -> Frame {
+    if frames_for(kind).contains(&frame) { frame } else { default_frame(kind) }
+}
+
 /// The request for a symbol's bars.
 #[must_use]
 pub fn url(query: &str, frame: Frame) -> String {
@@ -204,7 +224,13 @@ impl Series {
         let mut points = self.points.clone();
         if let (Some(price), Some(last)) = (live, points.last().copied())
             && now_ms > last.ms + 1_000 {
-                points.push(Point { ms: now_ms, local: last.local + (now_ms - last.ms) / 1_000, close: price, phase });
+                let local = last.local + (now_ms - last.ms) / 1_000;
+                // A stock or an index draws the one day of its session: a price from another date (the night
+                // before the open, a weekend) has no place on it, and would crush the day against its edge.
+                let one_day = self.frame == Frame::Day && matches!(self.kind, Kind::Stock | Kind::Index);
+                if !one_day || local.div_euclid(DAY) == last.local.div_euclid(DAY) {
+                    points.push(Point { ms: now_ms, local, close: price, phase });
+                }
             }
         points
     }
@@ -228,10 +254,34 @@ pub fn nearest(line: &[(f32, f32)], x: f32) -> Option<usize> {
     })
 }
 
-/// When a point was: the time and the session for minutes, the date for days. The clock is the
-/// exchange's (New York) unless the series is a perpetual's, which has the Deck's own.
+/// The period a release of an indicator is for: "Oct 2026" for a month (the date is its last day), else the date.
+#[must_use]
+pub fn period_label(unix: i64) -> String {
+    let p = parts(unix);
+    if parts(unix + DAY).month == p.month {
+        let mut out = date_label(unix);
+        out.push_str(", ");
+        out.push_str(&year_label(unix));
+        return out;
+    }
+    month_label(unix)
+}
+
+/// "Oct 2026": the month and year of a date.
+fn month_label(unix: i64) -> String {
+    let mut out = String::from(MONTHS[(parts(unix).month - 1) % 12]);
+    out.push(' ');
+    out.push_str(&year_label(unix));
+    out
+}
+
+/// When a point was: the time and the session for minutes, the date for days, the month for an indicator.
+/// The clock is the exchange's (New York) unless the series is a perpetual's, which has the Deck's own.
 #[must_use]
 pub fn point_label(point: &Point, frame: Frame, kind: Kind) -> String {
+    if kind == Kind::Indicator {
+        return month_label(point.local);
+    }
     match frame {
         Frame::Day | Frame::Week => {
             let mut out = String::new();
@@ -404,7 +454,7 @@ pub fn plot(points: &[Point], frame: Frame, kind: Kind, reference: Option<f64>, 
         return None;
     }
     let (first, last) = (points[0], points[points.len() - 1]);
-    let reference = reference.filter(|_| frame == Frame::Day);
+    let reference = reference.filter(|_| frame == Frame::Day || kind == Kind::Indicator);
 
     // The price range, with some air above and below.
     let mut lo = points.iter().map(|p| p.close).fold(f64::INFINITY, f64::min);
@@ -668,6 +718,40 @@ mod tests {
     }
 
     #[test]
+    fn an_indicator_has_months_and_years_and_opens_on_a_year() {
+        assert_eq!(frames_for(Kind::Indicator), [Frame::HalfYear, Frame::Year, Frame::FiveYears]);
+        assert_eq!(frames_for(Kind::Stock), Frame::ALL);
+        assert_eq!((default_frame(Kind::Indicator), default_frame(Kind::Index)), (Frame::Year, Frame::Day));
+        assert_eq!(fit_frame(Kind::Indicator, Frame::Day), Frame::Year);
+        assert_eq!(fit_frame(Kind::Indicator, Frame::FiveYears), Frame::FiveYears);
+        assert_eq!(fit_frame(Kind::Stock, Frame::Week), Frame::Week);
+    }
+
+    #[test]
+    fn a_release_is_labelled_by_the_month_it_measures_or_by_its_date() {
+        // 2026-10-31 is the last day of October; 2026-11-14 is in the middle of a month.
+        assert_eq!(period_label(20_757 * DAY), "Oct 2026");
+        assert_eq!(period_label(20_771 * DAY), "Nov 14, 2026");
+    }
+
+    #[test]
+    fn the_live_price_does_not_leave_the_day_of_a_stock_or_an_index() {
+        let bar = |secs: i64| RawBar { ms: (20_780 * DAY + secs) * 1_000, local: 20_780 * DAY + secs, close: 10.0 };
+        let bars = [bar(14 * HOUR), bar(15 * HOUR)];
+        let index = Series::from_bars(Frame::Day, Kind::Index, &bars);
+        let now = |secs: i64| (20_780 * DAY + secs) * 1_000;
+        assert_eq!(index.with_live(Some(11.0), now(15 * HOUR + 600), Phase::Regular).len(), 3, "the same day");
+        assert_eq!(index.with_live(Some(11.0), now(40 * HOUR), Phase::Regular).len(), 2, "the next night is not on this day");
+        let stock = Series::from_bars(Frame::Day, Kind::Stock, &bars);
+        assert_eq!(stock.with_live(Some(11.0), now(40 * HOUR), Phase::Regular).len(), 2);
+        // A round-the-clock day goes across midnight, and a longer frame has room for any date.
+        let perp = Series::from_bars(Frame::Day, Kind::Perp, &bars);
+        assert_eq!(perp.with_live(Some(11.0), now(40 * HOUR), Phase::Regular).len(), 3);
+        let year = Series::from_bars(Frame::Year, Kind::Index, &bars);
+        assert_eq!(year.with_live(Some(11.0), now(40 * HOUR), Phase::Regular).len(), 3);
+    }
+
+    #[test]
     fn a_coin_has_no_bands_and_labels_by_its_own_clock() {
         let plot = plot(&day_series(Kind::Crypto), Frame::Day, Kind::Crypto, None, 1000.0, 200.0).expect("BUG: enough points");
         assert!(plot.bands.is_empty());
@@ -773,6 +857,8 @@ mod tests {
         assert_eq!(point_label(&at(0, Phase::Regular), Frame::Month, stock), "Nov 23");
         assert_eq!(point_label(&at(0, Phase::Regular), Frame::Year, stock), "Nov 23, 2026");
         assert_eq!(point_label(&at(0, Phase::Regular), Frame::FiveYears, stock), "Nov 23, 2026");
+        // An indicator is a month.
+        assert_eq!(point_label(&at(-53 * DAY, Phase::Regular), Frame::Year, Kind::Indicator), "Oct 2026");
         // A perpetual's clock is the Deck's own, so it names no zone.
         assert_eq!(point_label(&at(9 * HOUR + 41 * 60, Phase::Regular), Frame::Day, Kind::Perp), "09:41");
         assert_eq!(point_label(&at(17 * HOUR + 5 * 60, Phase::Regular), Frame::Week, Kind::Perp), "Mon 17:05");

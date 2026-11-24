@@ -1,4 +1,5 @@
-//! The watchlist: what the operator typed, what CNBC's quote service calls it, and what Hyperliquid does.
+//! The watchlist: what the operator typed, what CNBC's quote service calls it, what Hyperliquid does, and
+//! what TradingView calls the economic indicators and indexes that only it has.
 
 /// The most symbols a list can hold. The manifest says the same.
 pub const MAX_SYMBOLS: usize = 12;
@@ -11,6 +12,8 @@ pub enum Kind {
     Future,
     /// A Hyperliquid perpetual: it trades round the clock, so it has no sessions.
     Perp,
+    /// An economic indicator from TradingView (the ISM PMI, inflation, jobs): a value released now and then.
+    Indicator,
 }
 
 /// Where a symbol's prices come from.
@@ -19,6 +22,9 @@ pub enum Source {
     #[default]
     Hyperliquid,
     Cnbc,
+    /// TradingView, which prices the economic indicators and the indexes that the others lack. It is never the
+    /// operator's choice for the list: a symbol is its own when it has no other name.
+    Tv,
 }
 
 impl Source {
@@ -32,7 +38,7 @@ impl Source {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     /// What the screen calls it: `NVDA`, `BTC`, `S&P 500`.
     pub label: String,
@@ -42,6 +48,17 @@ pub struct Entry {
     pub kind: Kind,
     /// Its names on Hyperliquid, best first: `BTC`, `xyz:NVDA`. None for what only CNBC has.
     pub hl: Vec<String>,
+    /// Its ticker on TradingView (`ECONOMICS:USBCOI`), for what only that has; such a symbol is priced there.
+    pub tv: Option<String>,
+    /// The line that matters in its chart, such as the 50 that divides growth from contraction in a PMI.
+    pub pivot: Option<f64>,
+    /// What to call it under its label, when the service's own name is not the one wanted.
+    pub name: Option<String>,
+}
+
+/// An entry with only the names the market services know it by.
+fn market(label: String, query: String, kind: Kind, hl: Vec<String>) -> Entry {
+    Entry { label, query, kind, hl, tv: None, pivot: None, name: None }
 }
 
 /// The names people type for what the services write differently: CNBC's symbol, the label,
@@ -53,7 +70,6 @@ fn alias(typed: &str) -> Option<(&'static str, &'static str, Kind, &'static [&'s
         "^DJI" | "DJI" | ".DJI" | "DOW" | "DJIA" => (".DJI", "DOW", Kind::Index, &[]),
         "^NDX" | "NDX" | ".NDX" | "NASDAQ100" => (".NDX", "NASDAQ 100", Kind::Index, &["xyz:XYZ100"]),
         "^RUT" | "RUT" | ".RUT" => (".RUT", "RUSSELL 2000", Kind::Index, &[]),
-        "^VIX" | "VIX" | ".VIX" => (".VIX", "VIX", Kind::Index, &["xyz:VIX"]),
         "GOLD" | "XAU" | "XAU-USD" | "XAUUSD" | "GC=F" => ("@GC.1", "GOLD", Kind::Future, &["xyz:GOLD"]),
         "SILVER" | "XAG" | "XAG-USD" | "XAGUSD" | "SI=F" => ("@SI.1", "SILVER", Kind::Future, &["xyz:SILVER"]),
         "OIL" | "WTI" | "CL=F" | "CRUDE" => ("@CL.1", "OIL", Kind::Future, &["xyz:CL"]),
@@ -82,15 +98,75 @@ fn crypto_pair(typed: &str) -> Option<String> {
     fits.then(|| base.to_string())
 }
 
-/// `xyz:NVDA`: a Hyperliquid coin as that exchange writes it, a market of one of its builders (lower case)
-/// and a name. `cnbc:NVDA` asks for CNBC's quote instead.
+/// The builder markets of Hyperliquid, which write their coins `dex:NAME` with the market in lower case.
+const HL_DEXES: [&str; 11] = ["xyz", "flx", "vntl", "hyna", "km", "cash", "para", "mkts", "io", "abcd", "hl"];
+
+/// `xyz:NVDA`, `cnbc:NVDA`, `ECONOMICS:USBCOI`: a prefix, the name of a market or of a service, and what
+/// that market calls the symbol. Any symbol of CNBC's goes after `cnbc:`, and a whole TradingView ticker
+/// after `tv:`, so the tail may hold a hyphen, a slash or one more colon.
 fn prefixed(raw: &str) -> Option<(&str, &str)> {
     let (head, tail) = raw.split_once(':')?;
-    let name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
-    let head_fits = !head.is_empty() && head.len() <= 8 && head.bytes().all(name);
-    // After `cnbc:` any symbol goes, such as BTC-USD or BRK/B.
-    let tail_fits = !tail.is_empty() && tail.len() <= 24 && tail.bytes().all(|b| name(b) || matches!(b, b'-' | b'/' | b'^' | b'=' | b'&'));
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let head_fits = !head.is_empty() && head.len() <= 16 && head.bytes().all(word);
+    let tail_fits = !tail.is_empty() && tail.len() <= 32 && tail.bytes().all(|b| word(b) || matches!(b, b'-' | b'/' | b'^' | b'=' | b'&' | b'!' | b':'));
     (head_fits && tail_fits).then_some((head, tail))
+}
+
+/// A symbol of TradingView's from its ticker, `EXCHANGE:NAME`. What is not an economic indicator is shown
+/// like a future: priced round the clock by the exchange's clock, with no sessions drawn.
+fn tv_entry(ticker: &str) -> Option<Entry> {
+    let (exchange, name) = ticker.split_once(':')?;
+    if exchange.is_empty() || name.is_empty() {
+        return None;
+    }
+    let kind = if exchange == "ECONOMICS" { Kind::Indicator } else { Kind::Future };
+    Some(Entry { label: name.to_string(), query: ticker.to_string(), kind, hl: Vec::new(), tv: Some(ticker.to_string()), pivot: None, name: None })
+}
+
+/// A TradingView symbol the way a name is given for it: its ticker, label, kind, pivot line and display name.
+type TvAlias = (&'static str, &'static str, Kind, Option<f64>, Option<&'static str>);
+
+/// The names people type for what TradingView has: its ticker, the label, the kind, the line that matters in
+/// its chart, and the name to show. `key` is the typed name in capitals without hyphens or underscores.
+fn tv_alias(key: &str) -> Option<TvAlias> {
+    let economic = |ticker, label| Some((ticker, label, Kind::Indicator, None, None));
+    // A purchasing managers index: above 50 the industry grows, below it shrinks.
+    let pmi = |ticker, label| Some((ticker, label, Kind::Indicator, Some(50.0), None));
+    // What trades on a futures or a bond market, with the name to show under its label.
+    let market = |ticker, label, name| Some((ticker, label, Kind::Future, None, Some(name)));
+    match key {
+        "US10Y" | "US10YR" => market("TVC:US10Y", "US10Y", "US 10 Year Treasury Yield"),
+        "US2Y" | "US02Y" => market("TVC:US02Y", "US2Y", "US 2 Year Treasury Yield"),
+        "US5Y" | "US05Y" => market("TVC:US05Y", "US5Y", "US 5 Year Treasury Yield"),
+        "US30Y" => market("TVC:US30Y", "US30Y", "US 30 Year Treasury Yield"),
+        "DXY" | "USDX" => market("TVC:DXY", "DXY", "US Dollar Index (DXY)"),
+        "COPPER" => market("COMEX:HG1!", "COPPER", "Copper futures"),
+        "NATGAS" | "NATURALGAS" => market("NYMEX:NG1!", "NATGAS", "Natural gas futures"),
+        "PLATINUM" => market("NYMEX:PL1!", "PLATINUM", "Platinum futures"),
+        "PALLADIUM" => market("NYMEX:PA1!", "PALLADIUM", "Palladium futures"),
+        "ISM" | "ISMPMI" | "PMI" | "ISMMANUFACTURING" | "ISMMANUFACTURINGPMI" => pmi("ECONOMICS:USBCOI", "ISM PMI"),
+        "ISMNEWORDERS" => pmi("ECONOMICS:USMNO", "ISM ORD"),
+        "ISMPRICES" => pmi("ECONOMICS:USMPR", "ISM PRC"),
+        "ISMEMPLOYMENT" => pmi("ECONOMICS:USMEMP", "ISM JOB"),
+        "ISMSERVICES" | "ISMNONMANUFACTURING" => pmi("ECONOMICS:USNMBA", "ISM SVC"),
+        "CPI" | "INFLATION" => economic("ECONOMICS:USIRYY", "CPI YOY"),
+        "CORECPI" | "COREINFLATION" => economic("ECONOMICS:USCIR", "CORE"),
+        "CPIINDEX" => economic("ECONOMICS:USCPI", "CPI IDX"),
+        "PPI" => economic("ECONOMICS:USPPIYY", "PPI YOY"),
+        "UNEMPLOYMENT" | "UNRATE" => economic("ECONOMICS:USUR", "UNRATE"),
+        "NFP" | "PAYROLLS" | "NONFARM" | "NONFARMPAYROLLS" => economic("ECONOMICS:USNFP", "NFP"),
+        "GDP" | "GDPGROWTH" => economic("ECONOMICS:USGDPQQ", "GDP QOQ"),
+        "FEDRATE" | "FEDFUNDS" | "FOMC" | "INTERESTRATE" => economic("ECONOMICS:USINTR", "FED"),
+        "RETAILSALES" => economic("ECONOMICS:USRSMM", "RETAIL"),
+        "CLAIMS" | "JOBLESSCLAIMS" | "INITIALCLAIMS" => economic("ECONOMICS:USIJC", "CLAIMS"),
+        "CONSUMERCONFIDENCE" => economic("ECONOMICS:USCCI", "CONF"),
+        "HOUSINGSTARTS" => economic("ECONOMICS:USHST", "STARTS"),
+        "INDUSTRIALPRODUCTION" => economic("ECONOMICS:USIPMM", "IND PROD"),
+        "TRADEBALANCE" => economic("ECONOMICS:USBOT", "TRADE"),
+        // The index itself, in real time; CBOE:VIX is the same index 15 minutes late.
+        "VIX" | "^VIX" | ".VIX" | "CBOEVIX" => Some(("TVC:VIX", "VIX", Kind::Index, None, Some("Cboe Volatility Index (VIX)"))),
+        _ => None,
+    }
 }
 
 /// One list item as the services know it; `None` for a blank item.
@@ -103,23 +179,36 @@ pub fn resolve(raw: &str) -> Option<Entry> {
         return None;
     }
     if let Some((head, tail)) = prefixed(&compact) {
-        let name = tail.to_uppercase();
-        if head.eq_ignore_ascii_case("cnbc") {
+        let (name, head) = (tail.to_uppercase(), head.to_lowercase());
+        if head == "cnbc" {
             let mut entry = resolve_cnbc(&name)?;
             entry.hl.clear();
             return Some(entry);
         }
+        if head == "tv" || head == "tradingview" {
+            return tv_entry(&name);
+        }
         // A coin exactly as Hyperliquid names it. CNBC has the commodities and indexes under other names, and
         // for the rest the plain ticker is its best guess.
-        if name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.')) {
-            let coin = format!("{}:{}", head.to_lowercase(), name);
+        if HL_DEXES.contains(&head.as_str()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.')) {
+            let coin = format!("{head}:{name}");
             if let Some((query, label, kind, _)) = alias(builder_name(&name)) {
-                return Some(Entry { label: label.to_string(), query: query.to_string(), kind, hl: vec![coin] });
+                return Some(market(label.to_string(), query.to_string(), kind, vec![coin]));
             }
-            return Some(Entry { label: name.clone(), query: name, kind: Kind::Stock, hl: vec![coin] });
+            return Some(market(name.clone(), name, Kind::Stock, vec![coin]));
         }
+        // Any other prefix is an exchange of TradingView's: ECONOMICS:USBCOI, TVC:DXY, NASDAQ:NVDA.
+        let exchange = if head == "econ" { "ECONOMICS".to_string() } else { head.to_uppercase() };
+        return tv_entry(&format!("{exchange}:{name}"));
     }
-    let mut entry = resolve_cnbc(&compact.to_uppercase())?;
+    let typed = compact.to_uppercase();
+    let key: String = typed.chars().filter(|c| !matches!(c, '-' | '_')).collect();
+    if let Some((ticker, label, kind, pivot, name)) = tv_alias(&key) {
+        let mut entry = tv_entry(ticker)?;
+        (entry.label, entry.kind, entry.pivot, entry.name) = (label.to_string(), kind, pivot, name.map(str::to_string));
+        return Some(entry);
+    }
+    let mut entry = resolve_cnbc(&typed)?;
     if entry.hl.is_empty() && entry.kind == Kind::Stock {
         // A plain ticker: a crypto perpetual of the main market, or a stock or commodity of the biggest builder's.
         if entry.query.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -134,16 +223,16 @@ fn resolve_cnbc(typed: &str) -> Option<Entry> {
         return None;
     }
     if let Some((query, label, kind, hl)) = alias(typed) {
-        return Some(Entry { label: label.to_string(), query: query.to_string(), kind, hl: hl.iter().map(|c| (*c).to_string()).collect() });
+        return Some(market(label.to_string(), query.to_string(), kind, hl.iter().map(|c| (*c).to_string()).collect()));
     }
     if let Some(base) = crypto_pair(typed) {
         // Hyperliquid writes the small coins of the main market with a k: kPEPE.
         let hl = vec![base.clone(), format!("k{base}")];
-        return Some(Entry { query: fmt_coin(&base), label: base, kind: Kind::Crypto, hl });
+        return Some(market(base.clone(), fmt_coin(&base), Kind::Crypto, hl));
     }
     // Share classes: the service writes BRK.B where people write BRK-B or BRK/B.
     let query = share_class(typed);
-    Some(Entry { label: typed.to_string(), query, kind: Kind::Stock, hl: Vec::new() })
+    Some(market(typed.to_string(), query, Kind::Stock, Vec::new()))
 }
 
 fn fmt_coin(base: &str) -> String {
@@ -299,7 +388,7 @@ mod tests {
     fn what_has_a_builder_market_names_it() {
         assert_eq!(one("gold").hl, ["xyz:GOLD"]);
         assert_eq!(one("^GSPC").hl, ["xyz:SP500"]);
-        assert_eq!(one("vix").hl, ["xyz:VIX"]);
+        assert_eq!(one("xyz:vix").hl, ["xyz:VIX"], "the perpetual on the VIX is named, not guessed");
         assert!(one("^DJI").hl.is_empty());
     }
 
@@ -326,6 +415,58 @@ mod tests {
         // A stock is still its ticker, and a plain CL is still Colgate-Palmolive.
         assert_eq!(one("xyz:nvda").query, "NVDA");
         assert_eq!((one("CL").query.as_str(), one("CL").kind), ("CL", Kind::Stock));
+    }
+
+    #[test]
+    fn the_ism_purchasing_managers_index_is_a_tradingview_indicator_with_its_fifty_line() {
+        for typed in ["ISM", "ism-pmi", "PMI", "ISM PMI", "ism_manufacturing"] {
+            let e = one(typed);
+            assert_eq!((e.tv.as_deref(), e.label.as_str(), e.kind, e.pivot), (Some("ECONOMICS:USBCOI"), "ISM PMI", Kind::Indicator, Some(50.0)), "{typed}");
+            assert_eq!(e.query, "ECONOMICS:USBCOI");
+            assert!(e.hl.is_empty());
+        }
+        let jobs = one("unemployment");
+        assert_eq!((jobs.tv.as_deref(), jobs.pivot), (Some("ECONOMICS:USUR"), None));
+        assert_eq!(one("Fed-Rate").tv.as_deref(), Some("ECONOMICS:USINTR"));
+        assert_eq!(one("nfp").tv.as_deref(), Some("ECONOMICS:USNFP"));
+    }
+
+    #[test]
+    fn any_economic_ticker_can_be_written_as_tradingview_writes_it() {
+        let e = one("economics:usbcoi");
+        assert_eq!((e.tv.as_deref(), e.label.as_str(), e.kind, e.pivot), (Some("ECONOMICS:USBCOI"), "USBCOI", Kind::Indicator, None));
+        assert_eq!(one("econ:USCCI").tv.as_deref(), Some("ECONOMICS:USCCI"));
+        assert_eq!(one("tv:economics:usnfp").tv.as_deref(), Some("ECONOMICS:USNFP"));
+    }
+
+    #[test]
+    fn the_vix_is_the_index_in_real_time_and_other_tickers_follow_tradingviews_names() {
+        for typed in ["VIX", "^VIX", ".vix"] {
+            let e = one(typed);
+            assert_eq!((e.tv.as_deref(), e.label.as_str(), e.kind), (Some("TVC:VIX"), "VIX", Kind::Index), "{typed}");
+            assert_eq!(e.name.as_deref(), Some("Cboe Volatility Index (VIX)"));
+        }
+        let delayed = one("cboe:vix");
+        assert_eq!((delayed.tv.as_deref(), delayed.label.as_str()), (Some("CBOE:VIX"), "VIX"));
+        assert_eq!(one("tv:TVC:DXY").tv.as_deref(), Some("TVC:DXY"));
+        assert_eq!(one("nasdaq:nvda").tv.as_deref(), Some("NASDAQ:NVDA"));
+        // The Hyperliquid perpetual on the VIX and CNBC's own VIX are asked for by name.
+        assert_eq!(one("xyz:VIX").tv, None);
+        assert_eq!(one("cnbc:VIX").tv, None);
+        assert_eq!(resolve_all(&["VIX", "tvc:vix", "^VIX"]).len(), 1, "the same ticker is one row");
+    }
+
+    #[test]
+    fn yields_the_dollar_and_metals_without_a_hyperliquid_market_come_from_tradingview() {
+        let ten = one("us10y");
+        assert_eq!((ten.tv.as_deref(), ten.label.as_str(), ten.kind), (Some("TVC:US10Y"), "US10Y", Kind::Future));
+        assert_eq!(ten.name.as_deref(), Some("US 10 Year Treasury Yield"));
+        assert_eq!(one("US-02Y").tv.as_deref(), Some("TVC:US02Y"));
+        assert_eq!(one("dxy").tv.as_deref(), Some("TVC:DXY"));
+        assert_eq!(one("copper").tv.as_deref(), Some("COMEX:HG1!"));
+        assert_eq!(one("comex:hg1!").tv.as_deref(), Some("COMEX:HG1!"), "typed as TradingView writes it");
+        assert_eq!(one("xyz:DXY").tv, None, "the Hyperliquid market of the dollar index is named, not guessed");
+        assert_eq!(one("gold").tv, None, "gold keeps its Hyperliquid market");
     }
 
     #[test]

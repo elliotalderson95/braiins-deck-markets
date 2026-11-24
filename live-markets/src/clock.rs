@@ -37,11 +37,17 @@ fn summer_time(unix: i64) -> bool {
     (starts..ends).contains(&unix)
 }
 
+/// New York's offset from UTC at a Unix time, in seconds: minus five hours, minus four in summer.
+#[must_use]
+pub fn new_york_offset(unix: i64) -> i64 {
+    if summer_time(unix) { -4 * HOUR } else { -5 * HOUR }
+}
+
 /// The session of the US stock market at a Unix time: pre-market from 4:00, open from 9:30, after
 /// hours from 16:00 to 20:00, on weekdays by the New York clock.
 #[must_use]
 pub fn us_session(unix: i64) -> Session {
-    let local = unix + if summer_time(unix) { -4 * HOUR } else { -5 * HOUR };
+    let local = unix + new_york_offset(unix);
     let days = local.div_euclid(DAY);
     if matches!(weekday(days), 0 | 6) {
         return Session::Closed;
@@ -106,6 +112,12 @@ mod tests {
         assert_eq!(us_session(utc(2026, 11, 24, 21, 0)), Session::Post, "16:00");
         assert_eq!(us_session(utc(2026, 11, 25, 0, 59)), Session::Post, "19:59");
         assert_eq!(us_session(utc(2026, 11, 25, 1, 0)), Session::Closed, "20:00");
+    }
+
+    #[test]
+    fn new_york_is_four_or_five_hours_behind() {
+        assert_eq!(new_york_offset(utc(2026, 7, 15, 12, 0)), -4 * HOUR);
+        assert_eq!(new_york_offset(utc(2026, 11, 24, 12, 0)), -5 * HOUR);
     }
 
     #[test]

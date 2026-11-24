@@ -24,6 +24,7 @@ const DOWN: Color = Color::from_hex(0xFF_5C_62);
 const AMBER: Color = Color::from_hex(0xF6_A8_2B);
 const VIOLET: Color = Color::from_hex(0xA2_93_FF);
 const SKY: Color = Color::from_hex(0x4F_B7_F0);
+const ROSE: Color = Color::from_hex(0xF0_7B_C0);
 
 const HEADER_H: f32 = 52.0;
 const MIN_CELL_W: f32 = 270.0;
@@ -81,6 +82,8 @@ pub struct DetailLayout {
     pub jog_left: Option<Rect>,
     pub jog_right: Option<Rect>,
     pub frames: [Rect; 6],
+    /// The time frames on offer, in order: they take the first buttons of `frames`.
+    pub frame_set: &'static [Frame],
     /// The chart with its axis labels.
     pub chart: Rect,
     /// Where the symbol's name starts, and where the price block must end.
@@ -109,8 +112,16 @@ impl DetailLayout {
     }
 }
 
+/// The screen of a symbol that has every time frame.
+#[cfg(test)]
 #[must_use]
 pub fn detail_layout(w: f32, h: f32) -> DetailLayout {
+    detail_layout_for(w, h, &Frame::ALL)
+}
+
+/// The screen of a symbol that has these time frames.
+#[must_use]
+pub fn detail_layout_for(w: f32, h: f32, frame_set: &'static [Frame]) -> DetailLayout {
     let class = if h < 300.0 {
         DetailClass::Compact
     } else if w < 900.0 {
@@ -165,6 +176,7 @@ pub fn detail_layout(w: f32, h: f32) -> DetailLayout {
         jog_left,
         jog_right,
         frames,
+        frame_set,
         chart,
         title_x: back.x + back.w + if class == DetailClass::Compact { 10.0 } else { 18.0 },
         price_edge: prev.map_or(w - pad, |p| p.x - 18.0),
@@ -206,7 +218,7 @@ pub fn resolve(hits: &Hits, x: f32, y: f32) -> Tap {
             } else if d.next.is_some_and(|r| r.contains(x, y)) {
                 Tap::Step(1)
             } else {
-                d.frames.iter().position(|r| r.contains(x, y)).map_or(Tap::Nothing, |i| Tap::Frame(Frame::ALL[i]))
+                d.frames.iter().zip(d.frame_set).find(|(r, _)| r.contains(x, y)).map_or(Tap::Nothing, |(_, frame)| Tap::Frame(*frame))
             }
         }
     }
@@ -326,8 +338,14 @@ fn tone(pct: f64) -> Color {
     }
 }
 
+/// A move as the symbol shows it: in percent, and for an indicator in its own unit ("+1.0 points").
+fn change_text(change: f64, kind: Kind) -> String {
+    if kind == Kind::Indicator { format::delta(change) } else { format::percent(change) }
+}
+
 fn tag_style(tag: Tag) -> (&'static str, Color) {
     match tag {
+        Tag::Econ => ("ECON", ROSE),
         Tag::Pre => ("PRE", AMBER),
         Tag::After => ("AFTER", VIOLET),
         Tag::Closed => ("CLOSED", MUTE),
@@ -363,6 +381,14 @@ fn note_text(note: Note, kind: Kind, wide: bool) -> Option<(String, Color)> {
         Note::PrevClose(p) => Some((join(&["Prev ", &format::price(p, kind)]), MUTE)),
         Note::PreMarket(pct) => pct.map(|p| (join(&[if wide { "Pre-market " } else { "Pre " }, &format::percent(p)]), tone(p))),
         Note::Volume(v) => Some((join(&["Vol $", &format::compact(v)]), MUTE)),
+        Note::Release { period_end, prev } => {
+            let mut s = chart::period_label(period_end);
+            if let Some(p) = prev.filter(|_| wide) {
+                s.push_str(", prev ");
+                s.push_str(&format::indicator(p));
+            }
+            Some((s, MUTE))
+        }
         Note::Close { price, pct } => {
             let mut s = join(&["Close ", &format::price(price, kind)]);
             if let Some(p) = pct {
@@ -380,6 +406,9 @@ fn join(parts: &[&str]) -> String {
 
 /// The company's name as the service writes it; for coins the part before the slash ("Bitcoin/USD ...").
 fn display_name(item: &Row) -> Option<String> {
+    if let Some(name) = &item.entry.name {
+        return Some(name.clone());
+    }
     let name = item.quote.as_ref()?.name.as_str();
     let name = if item.kind() == Kind::Crypto { name.split('/').next().unwrap_or(name) } else { name };
     (!name.is_empty()).then(|| name.to_string())
@@ -394,8 +423,9 @@ fn cell(item: &Row, b: Band, cw: f32, ch: f32, now_ms: u64, fade: bool) -> Node 
         style!(size: b.label, weight: FontWeight::BOLD, color: shade(INK, fade), text_overflow: TextOverflow::Ellipsis),
     )];
     if let Some(tag) = view.and_then(|v| v.tag) {
-        // Only a wide cell has room for the word; the others get a dot of its color.
-        head.push(if b.wide { tag_pill(tag, b.tag, fade) } else { tag_dot(tag, fade) });
+        // Only a wide cell has room for the word, and then only beside a short label; the others get a dot of its color.
+        let roomy = b.wide && item.entry.label.chars().count() + tag_style(tag).0.len() <= 12;
+        head.push(if roomy { tag_pill(tag, b.tag, fade) } else { tag_dot(tag, fade) });
     }
     let mut left = vec![row(props!(gap: 8.0, cross_align: CrossAlign::Center), head)];
     if b.show_name
@@ -442,7 +472,7 @@ fn cell(item: &Row, b: Band, cw: f32, ch: f32, now_ms: u64, fade: bool) -> Node 
 
     // Right: the move.
     let (pill_text, pill_color) = match view.and_then(|v| v.pct) {
-        Some(p) => (format::percent(p), shade(tone(p), fade)),
+        Some(p) => (change_text(p, item.kind()), shade(tone(p), fade)),
         None => (String::new(), DIM),
     };
     let pill = row(
@@ -703,9 +733,9 @@ fn chart_message(cw: f32, ch: f32, line: &str) -> Vec<Draw> {
 #[expect(clippy::cast_precision_loss, reason = "a screen size in pixels")]
 fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, Hits) {
     let (wf, hf) = (w as f32, h as f32);
-    let mut layout = detail_layout(wf, hf);
     let item = &state.rows[d.row];
     let kind = item.kind();
+    let mut layout = detail_layout_for(wf, hf, chart::frames_for(kind));
     let view = item.quote.as_ref().map(Quote::view);
     let class = layout.class;
     let compact = class == DetailClass::Compact;
@@ -724,9 +754,12 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         DetailClass::Compact => 12,
     };
     let rect = layout.chart;
-    let points = d.series.as_ref().map(|s| s.with_live(view.map(|v| v.price), now * 1_000, phase));
+    // An indicator has no price that moves between its releases: its last bar is its latest value.
+    let live = if kind == Kind::Indicator { None } else { view.map(|v| v.price) };
+    let points = d.series.as_ref().map(|s| s.with_live(live, now * 1_000, phase));
     let plot = points.as_deref().and_then(|p| {
-        let reference = item.quote.as_ref().and_then(|q| q.prev_close);
+        // The line across the chart: the price a day ago, or the 50 that divides a PMI's growth from its contraction.
+        let reference = if kind == Kind::Indicator { item.entry.pivot } else { item.quote.as_ref().and_then(|q| q.prev_close) };
         chart::plot(p, d.frame, kind, reference, rect.w - axis_w, rect.h - label_h)
     });
     // A finger on the chart: the point it is over.
@@ -755,9 +788,14 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         (Some(a), Some(b)) if a.close != 0.0 => Some((b.close / a.close - 1.0) * 100.0),
         _ => None,
     });
-    let pct = if d.frame == Frame::Day { view.and_then(|v| v.pct) } else { frame_move.or(view.and_then(|v| v.pct)) };
+    let pct = if d.frame == Frame::Day || kind == Kind::Indicator { view.and_then(|v| v.pct) } else { frame_move.or(view.and_then(|v| v.pct)) };
     // Under a finger the header reads the price then, and its move from where the frame began.
     let (shown_price, pct) = match scrub {
+        // An indicator's move is from the release before it.
+        Some((i, p)) if kind == Kind::Indicator => {
+            let before = i.checked_sub(1).and_then(|j| points.as_ref().and_then(|v| v.get(j)));
+            (Some(p.close), before.map(|b| p.close - b.close))
+        }
         Some((_, p)) => {
             let day_base = if d.frame == Frame::Day { item.quote.as_ref().and_then(|q| q.prev_close) } else { None };
             let base = day_base.or_else(|| points.as_ref().and_then(|v| v.first()).map(|f| f.close));
@@ -808,7 +846,7 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
     }
     let price_text = shown_price.map_or_else(|| "...".to_string(), |p| format::price(p, kind));
     let (pill_text, pill_color) = match pct {
-        Some(p) => (format::percent(p), tone(p)),
+        Some(p) => (change_text(p, kind), tone(p)),
         None => (String::new(), DIM),
     };
     let head_h = layout.back.h;
@@ -834,7 +872,7 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         DetailClass::Medium => 18,
         DetailClass::Compact => 14,
     };
-    for (r, frame) in layout.frames.iter().zip(Frame::ALL) {
+    for (r, frame) in layout.frames.iter().zip(layout.frame_set.iter().copied()) {
         children.push(frame_button(*r, frame.label(kind), frame == d.frame, button_size));
     }
     if class == DetailClass::Full {
@@ -1095,5 +1133,65 @@ mod tests {
         assert_eq!(tag_style(Tag::Perp).0, "PERP");
         let (line, _) = note_text(Note::Volume(1_615_050_662.0), Kind::Perp, true).expect("BUG: a volume has a line");
         assert_eq!(line, "Vol $1.6B");
+    }
+
+    #[test]
+    fn an_indicator_builds_at_every_size_with_only_the_frames_it_has() {
+        use crate::symbols::{Source, resolve_all};
+        use crate::tv::{Reading, series};
+
+        let mut state = State { interval_ms: 2_000, ..State::default() };
+        state.set_entries(resolve_all(&["ISM", "VIX", "NVDA"]), Source::Hyperliquid);
+        let reading = |ticker: &str, close: f64, economic: bool| Reading {
+            ticker: ticker.into(),
+            description: "United States ISM Purchasing Managers Index (PMI)".into(),
+            close,
+            change_pct: 1.8,
+            change_abs: 1.0,
+            time: 1_793_404_800,
+            economic,
+            delayed: false,
+        };
+        state.apply_tv(&[reading("ECONOMICS:USBCOI", 55.5, true), reading("TVC:VIX", 28.9, false)], 1_000);
+        let months: Vec<(i64, f64)> = (0..60).map(|i| ((20_727 - 30 * (59 - i)) * 86_400, 50.0 + (i as f64 / 5.0).sin() * 3.0)).collect();
+        for frame in chart::frames_for(Kind::Indicator) {
+            for (w, h) in [(1280, 480), (638, 480), (638, 238), (317, 238)] {
+                for finger in [None, Some(Scrub::Px(0.0)), Some(Scrub::Px(300.0)), Some(Scrub::Fraction(1.0))] {
+                    let mut detail = Detail::new(0, *frame);
+                    detail.series = series(&months, Kind::Indicator, *frame);
+                    assert!(detail.series.is_some(), "{frame:?}");
+                    detail.scrub = finger;
+                    state.screen = Screen::Detail(detail);
+                    let (_, hits) = screen(&state, w, h, 1_000);
+                    let Hits::Detail(layout) = hits else { panic!("BUG: a chart") };
+                    assert_eq!(layout.frame_set, [Frame::HalfYear, Frame::Year, Frame::FiveYears]);
+                }
+            }
+        }
+        // The second button is the year, and the fourth is no button.
+        let layout = detail_layout_for(1280.0, 480.0, chart::frames_for(Kind::Indicator));
+        let hits = Hits::Detail(layout.clone());
+        assert_eq!(resolve(&hits, layout.frames[1].x + 4.0, layout.frames[1].y + 4.0), Tap::Frame(Frame::Year));
+        assert_eq!(resolve(&hits, layout.frames[3].x + 4.0, layout.frames[3].y + 4.0), Tap::Nothing);
+        // The VIX, an index of TradingView's, has every frame, and its screens build too.
+        state.screen = Screen::Detail(Detail::new(1, Frame::Day));
+        for (w, h) in [(1280, 480), (638, 238)] {
+            let (_, hits) = screen(&state, w, h, 1_000);
+            assert!(matches!(&hits, Hits::Detail(l) if l.frame_set.len() == 6), "{w}x{h}");
+        }
+        state.screen = Screen::List;
+        let (_, hits) = screen(&state, 1280, 480, 1_000);
+        assert!(matches!(hits, Hits::List { .. }));
+    }
+
+    #[test]
+    fn the_economic_tag_and_the_release_note_read_well() {
+        assert_eq!(tag_style(Tag::Econ).0, "ECON");
+        let (line, _) = note_text(Note::Release { period_end: 20_757 * 86_400, prev: Some(54.5) }, Kind::Indicator, true).expect("BUG: a release has a line");
+        assert_eq!(line, "Oct 2026, prev 54.5");
+        let (short, _) = note_text(Note::Release { period_end: 20_757 * 86_400, prev: Some(54.5) }, Kind::Indicator, false).expect("BUG: a release has a line");
+        assert_eq!(short, "Oct 2026");
+        assert_eq!(change_text(1.0, Kind::Indicator), "+1");
+        assert_eq!(change_text(1.0, Kind::Index), "+1.00%");
     }
 }

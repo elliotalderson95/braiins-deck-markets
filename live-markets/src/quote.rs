@@ -50,6 +50,7 @@ pub struct Ext {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[expect(clippy::struct_excessive_bools, reason = "where a quote comes from, as flags a screen reads one by one")]
 pub struct Quote {
     pub name: String,
     pub session: Session,
@@ -66,6 +67,14 @@ pub struct Quote {
     pub perp: bool,
     /// The dollars traded in the last day, when the source says.
     pub volume: Option<f64>,
+    /// From TradingView, which prices what the others do not have.
+    pub tv: bool,
+    /// An economic indicator: a value released now and then, shown with its release and its change in units.
+    pub indicator: bool,
+    /// The change since the previous value, in the value's own unit.
+    pub delta: Option<f64>,
+    /// Unix time of the end of the period an indicator measures.
+    pub period_end: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +84,8 @@ pub enum Tag {
     Closed,
     Delayed,
     Perp,
+    /// An economic indicator.
+    Econ,
 }
 
 /// The line under the price.
@@ -89,6 +100,8 @@ pub enum Note {
     NoPreMarketTrades,
     /// The dollars traded in the last day.
     Volume(f64),
+    /// When an indicator was released for: the end of its period, and the value before.
+    Release { period_end: i64, prev: Option<f64> },
 }
 
 /// What a tile shows.
@@ -109,6 +122,14 @@ impl Quote {
     /// trade leads and the day's own close and move sit under it.
     #[must_use]
     pub fn view(&self) -> View {
+        if self.indicator {
+            return View {
+                price: self.last,
+                pct: self.delta,
+                tag: Some(Tag::Econ),
+                note: Note::Release { period_end: self.period_end, prev: self.prev_close },
+            };
+        }
         if self.perp {
             return View {
                 price: self.last,
@@ -198,7 +219,35 @@ impl Quote {
             traded_at: unix_time(&raw.last_time).unwrap_or(0),
             perp: false,
             volume: None,
+            tv: false,
+            indicator: false,
+            delta: None,
+            period_end: 0,
         })
+    }
+
+    /// What TradingView's scanner says of a ticker: an indicator's latest release against the one before, or
+    /// an index's price against its previous close.
+    #[must_use]
+    pub fn from_tv(reading: &crate::tv::Reading) -> Self {
+        // The previous value is the latest less its change, which the service writes with float noise.
+        let prev = ((reading.close - reading.change_abs) * 1e6).round() / 1e6;
+        Self {
+            name: reading.description.clone(),
+            session: Session::Regular,
+            last: reading.close,
+            prev_close: Some(prev),
+            day_pct: Some(reading.change_pct),
+            ext: None,
+            real_time: !reading.delayed,
+            traded_at: reading.time,
+            perp: false,
+            volume: None,
+            tv: true,
+            indicator: reading.economic,
+            delta: Some(reading.change_abs),
+            period_end: reading.time,
+        }
     }
 
     /// A Hyperliquid market's context as a quote: its mark price, against the price a day ago.
@@ -219,6 +268,10 @@ impl Quote {
             traded_at: now,
             perp: true,
             volume: number(&ctx.volume).filter(|v| *v > 0.0),
+            tv: false,
+            indicator: false,
+            delta: None,
+            period_end: 0,
         })
     }
 }
@@ -476,5 +529,40 @@ mod tests {
         let q = Quote::from_hl("BTC", &c, 1).expect("BUG: the mid is a price");
         assert!(close(q.last, 101.5));
         assert_eq!(q.view().note, Note::PrevClose(100.0), "no volume, so the old price is shown");
+    }
+
+    fn reading(close: f64, change_abs: f64, change_pct: f64, economic: bool, delayed: bool) -> crate::tv::Reading {
+        crate::tv::Reading {
+            ticker: "X:Y".into(),
+            description: "United States ISM Purchasing Managers Index (PMI)".into(),
+            close,
+            change_pct,
+            change_abs,
+            time: 1_793_404_800,
+            economic,
+            delayed,
+        }
+    }
+
+    #[test]
+    fn an_indicator_shows_its_value_its_change_in_units_and_its_release() {
+        let q = Quote::from_tv(&reading(55.5, 1.0000000000000284, 1.83, true, false));
+        let v = q.view();
+        assert!(close(v.price, 55.5));
+        assert!(close(v.pct.expect("BUG: a change"), 1.0));
+        assert_eq!(v.tag, Some(Tag::Econ));
+        let Note::Release { period_end, prev } = v.note else { panic!("BUG: a release note") };
+        assert_eq!(period_end, 1_793_404_800);
+        assert_eq!(prev, Some(54.5), "the float noise is rounded off the previous value");
+        assert!(q.tv && !q.perp);
+    }
+
+    #[test]
+    fn an_index_from_tradingview_reads_like_a_stock_and_says_when_it_is_late() {
+        let live = Quote::from_tv(&reading(28.93, 2.32, 8.72, false, false)).view();
+        assert_eq!(live.tag, None);
+        assert!(close(live.pct.expect("BUG: a move"), 8.72));
+        assert_eq!(live.note, Note::PrevClose(26.61));
+        assert_eq!(Quote::from_tv(&reading(28.66, 2.04, 7.66, false, true)).view().tag, Some(Tag::Delayed));
     }
 }

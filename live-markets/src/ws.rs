@@ -56,12 +56,21 @@ pub fn key(state: &mut u64) -> String {
     base64(&bytes)
 }
 
-/// The HTTP request that asks the server to turn the connection into a WebSocket.
+/// The HTTP request that asks the server to turn the connection into a WebSocket, with any headers
+/// the server wants besides (an `Origin`, for one).
 #[must_use]
-pub fn request(host: &str, path: &str, key: &str) -> String {
-    format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: LiveMarkets/0.4\r\n\r\n"
-    )
+pub fn request(host: &str, path: &str, key: &str, headers: &[(&str, &str)]) -> String {
+    let mut out = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: LiveMarkets/0.5\r\n"
+    );
+    for (name, value) in headers {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    out
 }
 
 /// A frame to send. A client masks everything it sends, with a key that changes from frame to frame.
@@ -297,12 +306,14 @@ mod tests {
 
     #[test]
     fn the_upgrade_request_names_the_host_and_the_key() {
-        let text = request("api.hyperliquid.xyz", "/ws", "dGhlIHNhbXBsZSBub25jZQ==");
+        let text = request("api.hyperliquid.xyz", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", &[("Origin", "https://example.test")]);
         assert!(text.starts_with("GET /ws HTTP/1.1\r\nHost: api.hyperliquid.xyz\r\n"));
         assert!(text.contains("Upgrade: websocket\r\n") && text.contains("Connection: Upgrade\r\n"));
         assert!(text.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
         assert!(text.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(text.contains("\r\nOrigin: https://example.test\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
+        assert!(!request("h", "/", "k", &[]).contains("Origin"));
     }
 
     #[test]

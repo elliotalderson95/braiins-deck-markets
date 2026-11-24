@@ -3,20 +3,21 @@
 Prices that follow the market, for a watchlist you choose. By default they come from **Hyperliquid**,
 whose markets never close: crypto, and the stocks, indexes and gold that its builders list there as
 perpetuals, pushed every second, night and weekend too. What Hyperliquid has no market for comes from
-**CNBC**, with the **pre-market and after-hours** moves of US stocks. Tap a symbol to see its **chart**
-and change the time frame.
+**CNBC**, with the **pre-market and after-hours** moves of US stocks. **TradingView** supplies the Cboe
+**VIX** and **economic indicators** such as the ISM Purchasing Managers Index. Tap a symbol to see its
+**chart** and change the time frame.
 
 ![Live Markets with Hyperliquid prices: PERP tags, the move over 24 hours, the volume, and two symbols from CNBC](docs/hl-list.png)
 
-## Two sources
+## Three sources
 
-| | Hyperliquid (the default) | CNBC |
-| --- | --- | --- |
-| What | Perpetuals: crypto, and the stocks, indexes and gold that builders list (`xyz:NVDA`) | Stocks, ETFs, indexes, gold, coins |
-| Hours | Round the clock, weekends too | US stock hours, with pre-market and after-hours |
-| The move | Against the price 24 hours ago | Against the previous close |
-| New prices | Pushed over a socket, about once a second | A request every 2 seconds (every 30 when closed) |
-| Tag | `PERP`, and the volume of the day under the price | `PRE`, `AFTER`, or none |
+| | Hyperliquid (the default) | CNBC | TradingView |
+| --- | --- | --- | --- |
+| What | Perpetuals: crypto, and the stocks, indexes and gold that builders list (`xyz:NVDA`) | Stocks, ETFs, indexes, gold, coins | Economic indicators (`ISM`, `CPI`, `NFP`) and indexes (`VIX`, `TVC:DXY`) |
+| Hours | Round the clock, weekends too | US stock hours, with pre-market and after-hours | An indicator once a month or so; an index in its own hours |
+| The move | Against the price 24 hours ago | Against the previous close | An indicator: against the release before, in its own unit; an index: the previous close |
+| New prices | Pushed over a socket, about once a second | A request every 2 seconds (every 30 when closed) | A request every 10 seconds when an index is listed, every 10 minutes for indicators only |
+| Tag | `PERP`, and the volume of the day under the price | `PRE`, `AFTER`, or none | `ECON` with the month of the release, or none |
 
 A perpetual follows the price of its asset but is not that asset: `xyz:NVDA` is not NVIDIA's price on
 the Nasdaq, and at the weekend it keeps moving while the exchange is shut. Each symbol takes its price
@@ -27,6 +28,36 @@ from the first place that has it: Hyperliquid's main market (`BTC`, `ETH`), then
 prices its symbols until it can.
 
 ![Live Markets in regular hours, with CNBC prices: the day's move, and how the stock traded before the open](docs/live.png)
+
+## Economic indicators and the VIX
+
+Type the name in the symbols setting like any other symbol. The ISM Purchasing Managers Index is `ISM` (or
+`ISM-PMI`, `PMI`): it shows the latest value, its change against the month before (`+1`), the month it is for
+and the value before it. Its chart has the 50 line, above which manufacturing grows. The VIX is `VIX`: the
+Cboe Volatility Index in real time, drawn like any index, a day from 9:30 to 16:00 New York time.
+
+![Indicators and the VIX in the list, with the change of each against its last release](docs/indicators.png)
+
+| Type | Shows |
+| --- | --- |
+| `ISM`, `ISM-NEW-ORDERS`, `ISM-PRICES`, `ISM-EMPLOYMENT`, `ISM-SERVICES` | ISM Manufacturing PMI and its parts; services shows the ISM Services business activity |
+| `CPI`, `CORE-CPI`, `PPI` | Inflation against a year ago |
+| `UNEMPLOYMENT`, `NFP`, `CLAIMS` | Jobs: the rate, payrolls, initial claims |
+| `FED-RATE`, `GDP`, `RETAIL-SALES` | The Fed's rate, GDP growth on the quarter, retail sales on the month |
+| `CONSUMER-CONFIDENCE`, `HOUSING-STARTS`, `INDUSTRIAL-PRODUCTION`, `TRADE-BALANCE` | More of the same kind |
+| `VIX` | Cboe Volatility Index in real time (TradingView's `TVC:VIX`) |
+| `US10Y`, `US2Y`, `US5Y`, `US30Y`, `DXY` | Treasury yields and the dollar index, in real time |
+| `COPPER`, `NATGAS`, `PLATINUM`, `PALLADIUM` | Futures that Hyperliquid has no market for (10 minutes late, tagged `DELAYED`) |
+| `CBOE:VIX` | The same index as the Cboe sends it, 15 minutes late, tagged `DELAYED` |
+| `ECONOMICS:USCCI`, `TVC:DXY`, `tv:NASDAQ:NVDA` | Any ticker as TradingView writes it (`EXCHANGE:NAME`), with `econ:` for `ECONOMICS:` |
+
+The tickers of TradingView's economic indicators (`ECONOMICS:USBCOI` is "United States ISM Purchasing
+Managers Index (PMI)") are on its symbol search. An indicator's chart has months: 6M, 1Y and 5Y, with a
+cursor that reads each month. A name that TradingView does not know shows `No data`.
+
+![The ISM Purchasing Managers Index over a year, with the 50 line](docs/ism-chart.png)
+
+![The Cboe VIX over its last session](docs/vix-chart.png)
 
 ## Screens
 
@@ -96,6 +127,10 @@ its color.
   the day, about once a second each. A chart is a `candleSnapshot` request (5-minute candles for a day,
   30-minute for five days, 4-hour for a month, daily for 6 months and a year, weekly for 5 years), cut to
   at most 240 points. A name the exchange does not have is refused, and the symbol goes to CNBC.
+- **TradingView** (`scanner.tradingview.com`, `data.tradingview.com`). The scanner answers one request for
+  every ticker of this kind in the list with its latest value and change; the chart is asked of TradingView's
+  chart socket (a monthly series for an indicator, minutes and days for an index), only while a chart is
+  open. It is the public, keyless service that its own pages use, not a documented API.
 - **CNBC** (`quote.cnbc.com`, `ts-api.cnbc.com`): one request per update for the symbols that come from it,
   every `Update every` seconds (default 2) while any trades, every 30 seconds when all are closed.
 - **Neither is an official feed for this widget**, and either can change or stop. The widget says so when
@@ -107,8 +142,8 @@ its color.
   refuses a client that does not say what it is, so the widget sends its own `User-Agent`.
 - **A WebSocket without the Deck's WebSocket call.** The Deck's own WebSocket call is built without TLS, so
   it cannot open `wss://` addresses. The widget opens a verified TLS socket, which the Deck does offer, and
-  speaks the WebSocket protocol on it: the upgrade request, masked frames out, frames in, pongs for pings
-  (`live-markets/src/ws.rs`, with its tests).
+  speaks the WebSocket protocol on it: the upgrade request (with the `Origin` that TradingView wants),
+  masked frames out, frames in, pongs for pings (`live-markets/src/ws.rs`, with its tests).
 
 ## Setup
 
@@ -122,9 +157,9 @@ Symbols are written as on a stock exchange: `NVDA`, `AAPL`, `SPY`, `BRK.B` (or `
 (`GOLD` on Hyperliquid, delayed on CNBC). A name that neither service knows shows `No data`, so a typo is
 easy to see.
 
-Two prefixes choose the market: `xyz:NVDA` asks for one coin exactly as Hyperliquid names it (a builder's
-market, such as `xyz:`, `flx:`, `km:` or `cash:`, then the name), and `cnbc:NVDA` asks CNBC for that symbol
-and not Hyperliquid.
+Prefixes choose the market: `xyz:NVDA` asks for one coin exactly as Hyperliquid names it (a builder's
+market, such as `xyz:`, `flx:`, `km:` or `cash:`, then the name), `cnbc:NVDA` asks CNBC for that symbol
+and not Hyperliquid, and `tv:NASDAQ:NVDA` (or `NASDAQ:NVDA`) asks TradingView.
 
 ## Install and build
 
@@ -145,7 +180,7 @@ installed version; raise `version` in `live-markets/manifest.json` for an update
 
 The logic is in plain modules that the tests run on the Mac: `symbols` (what is typed and what each service
 calls it), `quote` (which price and move each session shows), `hl` (Hyperliquid's messages and candle
-requests), `ws` (the WebSocket protocol over a plain byte stream), `chart` (bars to points, bands and
+requests), `tv` (TradingView's scanner and chart socket), `ws` (the WebSocket protocol over a plain byte stream), `chart` (bars to points, bands and
 labels), `state` (the watchlist, the sources, the screen, taps) and `view` (the screens and where their
 buttons are). Only the glue in `lib.rs` touches the host.
 
@@ -192,5 +227,5 @@ tools/shot.sh livechart:1D /tmp/c.png     # the real markets, with the first sym
 ## License
 
 GPL-3.0-or-later; see [COPYING](COPYING). The widget is built with the Braiins Deck SDK, which is
-GPL-3.0-or-later too. It is not made by or affiliated with Braiins, CNBC, Hyperliquid or anyone whose
-prices it shows. Perpetuals are derivatives: this is a display, not advice.
+GPL-3.0-or-later too. It is not made by or affiliated with Braiins, CNBC, Hyperliquid, TradingView or anyone
+whose prices it shows. Perpetuals are derivatives: this is a display, not advice.

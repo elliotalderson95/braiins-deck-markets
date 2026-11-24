@@ -22,6 +22,7 @@ mod preview;
 mod quote;
 mod state;
 mod symbols;
+mod tv;
 mod view;
 mod ws;
 
@@ -39,6 +40,7 @@ mod widget {
     use crate::quote::{Raw, number};
     use crate::state::State;
     use crate::symbols::{Entry, Kind, Source, resolve_all};
+    use crate::tv;
     use crate::view::{self, Hits};
     use crate::ws;
 
@@ -50,6 +52,13 @@ mod widget {
     const POST_HEADERS: &str = "User-Agent: Mozilla/5.0 (X11; Linux armv7l) LiveMarkets/0.4\nAccept: application/json\nContent-Type: application/json";
     const BASE: &str = "/FormattedQuoteResult/FormattedQuote/";
     const BARS: &str = "/barData/priceBars/";
+
+    /// What the scanner of TradingView wants of a request.
+    const TV_HEADERS: &str = "User-Agent: Mozilla/5.0 (X11; Linux armv7l) LiveMarkets/0.5\nAccept: application/json\nContent-Type: application/json\nOrigin: https://www.tradingview.com";
+    /// How often TradingView is asked while it prices something that moves (the VIX), and when it prices only
+    /// indicators, which are released once a month.
+    const TV_LIVE_MS: u32 = 10_000;
+    const TV_RELEASE_MS: u32 = 600_000;
 
     const DEFAULT_REFRESH_S: i32 = 2;
     /// While every symbol of CNBC's is closed the quotes only change at the next session: look rarely.
@@ -64,6 +73,13 @@ mod widget {
         static POLL: RefCell<Option<PollHandle>> = const { RefCell::new(None) };
         /// The chart's poll: on only while a chart is open.
         static CHART: RefCell<Option<PollHandle>> = const { RefCell::new(None) };
+        /// TradingView's poll: on only while it has symbols to price.
+        static TV_POLL: RefCell<Option<PollHandle>> = const { RefCell::new(None) };
+        static TV_EVERY_MS: Cell<u32> = const { Cell::new(TV_LIVE_MS) };
+        /// The chart socket of TradingView, and the chart it is being asked for.
+        static TV_SOCKET: RefCell<Option<Socket>> = const { RefCell::new(None) };
+        static TV_DECODER: RefCell<ws::Decoder> = RefCell::new(ws::Decoder::default());
+        static TV_JOB: RefCell<Option<TvJob>> = const { RefCell::new(None) };
         /// The cadence the operator asked for, while a market is open.
         static REFRESH_MS: Cell<u32> = const { Cell::new(2_000) };
         /// The connection to Hyperliquid: a TLS socket that speaks WebSocket (see `ws`).
@@ -81,6 +97,16 @@ mod widget {
         static LIVE: Cell<bool> = const { Cell::new(true) };
         /// False while the widget is off screen.
         static AWAKE: Cell<bool> = const { Cell::new(true) };
+    }
+
+    /// A chart being fetched from TradingView's chart socket: whose, in which time frame, and the bars so far.
+    struct TvJob {
+        query: String,
+        kind: Kind,
+        frame: chart::Frame,
+        ticker: String,
+        bars: Vec<(i64, f64)>,
+        started_ms: u64,
     }
 
     fn read_params() -> (Vec<Entry>, u32, Source) {
@@ -159,17 +185,162 @@ mod widget {
         request_frame();
     }
 
-    /// Switches CNBC's poll on while it has symbols to price and off while it has none; `refetch` asks
-    /// for them at once, as after a symbol was handed over to it.
+    /// Switches the polls of CNBC and TradingView on while they have symbols to price and off while they have
+    /// none; `refetch` asks for the prices at once, as after a symbol was handed over to CNBC.
     fn sync_quotes(refetch: bool) {
-        let want = LIVE.get() && AWAKE.get() && STATE.with_borrow(State::needs_cnbc);
-        POLL.with_borrow(|handle| {
-            let Some(handle) = handle else { return };
-            handle.set_enabled(want);
-            if want && refetch {
-                handle.invalidate();
+        let awake = LIVE.get() && AWAKE.get();
+        let (cnbc, tv) = STATE.with_borrow(|s| (s.needs_cnbc(), s.needs_tv()));
+        for (poll, want) in [(&POLL, awake && cnbc), (&TV_POLL, awake && tv)] {
+            poll.with_borrow(|handle| {
+                let Some(handle) = handle else { return };
+                handle.set_enabled(want);
+                if want && refetch {
+                    handle.invalidate();
+                }
+            });
+        }
+        retune_tv();
+    }
+
+    // ── Indicators and indexes from TradingView ─────────────────────
+
+    fn build_tv_request(_handle: &PollHandle) -> Option<FetchSpec> {
+        let body = tv::scan_body(&STATE.with_borrow(State::tv_tickers))?;
+        Some(FetchSpec::post(tv::SCAN_URL).headers(TV_HEADERS).body(body).timeout(Duration::from_secs(10)))
+    }
+
+    /// The scanner is asked often while the VIX or another index is on the list, and rarely when there are only
+    /// indicators, which are released once a month.
+    fn retune_tv() {
+        let wanted = if STATE.with_borrow(State::tv_trades) { TV_LIVE_MS } else { TV_RELEASE_MS };
+        if TV_EVERY_MS.replace(wanted) != wanted {
+            TV_POLL.with_borrow(|handle| {
+                if let Some(handle) = handle {
+                    handle.set_interval(wanted);
+                }
+            });
+        }
+    }
+
+    fn on_tv_reply(handle: &PollHandle, response: &FetchResponse) {
+        let answer = response.ok().then(|| response.text()).flatten().filter(|text| text.contains(r#""data":"#));
+        if let Some(text) = answer {
+            let readings = tv::readings(text);
+            STATE.with_borrow_mut(|s| s.apply_tv(&readings, SystemTime::now().unix_secs));
+        } else {
+            log_warn!("live-markets: no usable answer from tradingview (status {})", response.status);
+            handle.retry();
+        }
+        request_frame();
+    }
+
+    /// Opens TradingView's chart socket for a symbol's bars, unless it is already doing so for this chart.
+    fn start_tv_chart(query: String, kind: Kind, frame: chart::Frame, ticker: String) {
+        if TV_JOB.with_borrow(|job| job.as_ref().is_some_and(|j| j.query == query && j.frame == frame)) {
+            return;
+        }
+        TV_SOCKET.set(None);
+        let started_ms = STATE.with_borrow(|s| s.uptime_ms);
+        if let Some(socket) = tls_connect(tv::HOST, 443, on_tv_event) {
+            TV_SOCKET.set(Some(socket));
+            TV_JOB.set(Some(TvJob { query, kind, frame, ticker, bars: Vec::new(), started_ms }));
+        } else {
+            log_warn!("live-markets: the host would not open the chart socket");
+            STATE.with_borrow_mut(|s| s.fail_chart(&query, frame));
+        }
+    }
+
+    /// The chart is in, or could not be had: the socket is closed and the screen told.
+    fn finish_tv_job(complete: bool) {
+        let Some(job) = TV_JOB.take() else { return };
+        TV_SOCKET.set(None);
+        let series = if complete { tv::series(&job.bars, job.kind, job.frame) } else { None };
+        if let Some(series) = series {
+            STATE.with_borrow_mut(|s| s.accept_chart(&job.query, series));
+        } else {
+            log_warn!("live-markets: no usable chart from tradingview ({} bars)", job.bars.len());
+            STATE.with_borrow_mut(|s| s.fail_chart(&job.query, job.frame));
+            CHART.with_borrow(|handle| {
+                if let Some(handle) = handle {
+                    handle.retry();
+                }
+            });
+        }
+        request_frame();
+    }
+
+    /// The upgrade was accepted: ask for the bars.
+    fn ask_tv_chart(socket: &Socket) {
+        let Some((kind, frame, ticker)) = TV_JOB.with_borrow(|job| job.as_ref().map(|j| (j.kind, j.frame, j.ticker.clone()))) else { return };
+        let mut state = RANDOM.get();
+        let id: String = (0..12).map(|_| char::from(b'a' + u8::try_from(ws::next_random(&mut state) % 26).unwrap_or(0))).collect();
+        RANDOM.set(state);
+        let (interval, count) = tv::chart_request(kind, frame);
+        for message in tv::chart_messages(&format!("cs_{id}"), &ticker, interval, count) {
+            send_text(socket, &message);
+        }
+    }
+
+    /// What the chart socket says. Whether the chart is finished.
+    fn on_tv_text(socket: &Socket, text: &str) -> bool {
+        for payload in tv::split_messages(text) {
+            if payload.starts_with("~h~") {
+                send_text(socket, &tv::frame_message(payload));
+                continue;
             }
-        });
+            match tv::chart_event(payload) {
+                tv::ChartEvent::Bars(bars) => TV_JOB.with_borrow_mut(|job| {
+                    if let Some(job) = job {
+                        job.bars.extend(bars);
+                    }
+                }),
+                tv::ChartEvent::Completed => {
+                    finish_tv_job(true);
+                    return true;
+                }
+                tv::ChartEvent::Failed => {
+                    finish_tv_job(false);
+                    return true;
+                }
+                tv::ChartEvent::Other => {}
+            }
+        }
+        false
+    }
+
+    fn on_tv_event(socket: &Socket, event: &SocketEvent<'_>) {
+        match event {
+            SocketEvent::Connected => {
+                TV_DECODER.set(ws::Decoder::default());
+                let mut state = RANDOM.get();
+                let key = ws::key(&mut state);
+                RANDOM.set(state);
+                socket.write(ws::request(tv::HOST, tv::WS_PATH, &key, &[("Origin", tv::ORIGIN)]).as_bytes());
+            }
+            SocketEvent::Data(bytes) => {
+                for event in TV_DECODER.with_borrow_mut(|decoder| decoder.push(bytes)) {
+                    match event {
+                        ws::Event::Open => ask_tv_chart(socket),
+                        ws::Event::Text(text) => {
+                            if on_tv_text(socket, &text) {
+                                return;
+                            }
+                        }
+                        ws::Event::Ping(payload) => {
+                            let mut state = RANDOM.get();
+                            let mask = ws::next_random(&mut state).to_le_bytes();
+                            RANDOM.set(state);
+                            socket.write(&ws::encode(ws::PONG, &payload, [mask[0], mask[1], mask[2], mask[3]]));
+                        }
+                        ws::Event::Close | ws::Event::Refused => {
+                            finish_tv_job(false);
+                            return;
+                        }
+                    }
+                }
+            }
+            SocketEvent::Closed(_) => finish_tv_job(false),
+        }
     }
 
     // ── Prices from Hyperliquid ─────────────────────────────────────
@@ -252,7 +423,7 @@ mod widget {
                 let mut state = RANDOM.get();
                 let key = ws::key(&mut state);
                 RANDOM.set(state);
-                socket.write(ws::request(hl::HOST, hl::WS_PATH, &key).as_bytes());
+                socket.write(ws::request(hl::HOST, hl::WS_PATH, &key, &[]).as_bytes());
             }
             SocketEvent::Data(bytes) => {
                 for event in DECODER.with_borrow_mut(|decoder| decoder.push(bytes)) {
@@ -328,6 +499,11 @@ mod widget {
 
     fn build_chart_request(_handle: &PollHandle) -> Option<FetchSpec> {
         let (query, kind, frame) = STATE.with_borrow(State::chart_target)?;
+        if let Some(ticker) = STATE.with_borrow(State::chart_tv) {
+            // TradingView's bars come over its socket, not from a request: start it, and no fetch follows.
+            start_tv_chart(query, kind, frame, ticker);
+            return None;
+        }
         let spec = if kind == Kind::Perp {
             let coin = STATE.with_borrow(State::chart_coin)?;
             let body = hl::candle_body(&coin, frame, SystemTime::now().unix_secs * 1_000)?;
@@ -452,6 +628,18 @@ mod widget {
             },
         );
         CHART.set(Some(chart_handle));
+        let tv_handle = register_poll(
+            build_tv_request,
+            on_tv_reply,
+            PollConfig {
+                interval_ms: Some(TV_LIVE_MS),
+                retry_ms: 5_000,
+                enabled: live && STATE.with_borrow(State::needs_tv),
+                ..PollConfig::default()
+            },
+        );
+        TV_POLL.set(Some(tv_handle));
+        retune_tv();
         sync_chart();
         ensure_ws();
     }
@@ -498,7 +686,9 @@ mod widget {
             s.screen = crate::state::Screen::List;
         });
         SOCKET.set(None);
-        for poll in [&POLL, &CHART] {
+        TV_JOB.set(None);
+        TV_SOCKET.set(None);
+        for poll in [&POLL, &CHART, &TV_POLL] {
             poll.with_borrow(|handle| {
                 if let Some(handle) = handle {
                     handle.set_enabled(false);
@@ -537,6 +727,10 @@ mod widget {
             sync_quotes(true);
         }
         ensure_ws();
+        let stuck = TV_JOB.with_borrow(|job| job.as_ref().is_some_and(|j| STATE.with_borrow(|s| s.uptime_ms.saturating_sub(j.started_ms)) > tv::CHART_PATIENCE_MS));
+        if stuck {
+            finish_tv_job(false);
+        }
         let result = render_ui(vp.width, vp.height, tree);
         // The taps came in on the screen drawn before this one, so they are read against its
         // buttons, and only then are the new screen's buttons kept for the next taps.
