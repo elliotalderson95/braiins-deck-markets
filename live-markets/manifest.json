@@ -1,10 +1,10 @@
 {
   "$schema": "../bmc-sdk/bmc-widget-manifest/manifest.schema.json",
   "uid": "6d57180e-ee7c-442b-ae4d-37db6f4b9e60",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "name": "Live Markets",
-  "description": "Live prices for stocks, ETFs, indexes and crypto, with pre-market and after-hours moves.",
-  "config_help": "Add up to 12 symbols, in the order you want them.\n\n**Stocks and ETFs:** `NVDA`, `AAPL`, `SPY`, `QQQ`, `BRK.B`\n\n**Crypto:** write pairs as `BTC-USD` or `ETH-USD`.\n\n**Indexes:** `^GSPC` (S&P 500), `^IXIC` (Nasdaq), `^DJI` (Dow Jones). Indexes have no pre-market or after-hours prices; for those moves use an ETF such as `SPY` or `QQQ`.\n\n**Gold:** `XAU-USD` (delayed).\n\nPre-market (4:00 to 9:30) and after-hours (16:00 to 20:00) moves show for US stocks and ETFs, in New York time. Prices come from CNBC's public quote service, which is not an official feed.",
+  "description": "Live prices and charts from Hyperliquid, round the clock: crypto, stocks, indexes and gold. CNBC for the rest, with pre-market and after-hours moves.",
+  "config_help": "Add up to 12 symbols, in the order you want them.\n\n**Stocks and ETFs:** `NVDA`, `TSLA`, `META`. **Crypto:** `BTC-USD`, `ETH-USD`, `SOL-USD`. **Indexes and gold:** `^GSPC` (S&P 500), `^NDX` (Nasdaq 100), `XAU-USD` (gold), `^VIX`.\n\n**Where the prices come from.** By default Hyperliquid, whose perpetuals trade 24 hours a day, 7 days a week, so a price moves on weekends and at night too. It is the price of a perpetual, not the exchange price of a stock, and the move shown is against 24 hours ago. A symbol Hyperliquid has no market for (for example `JPM`, `SPY`, `^DJI`) is asked of CNBC instead, with its pre-market and after-hours moves.\n\n**Choose the market.** `xyz:NVDA` asks for one coin as Hyperliquid names it (`xyz:`, `flx:`, `km:`, `cash:` and so on). `cnbc:NVDA` asks CNBC for that symbol. Or set the Prices from setting to CNBC to use CNBC for the whole list.\n\nNeither service is an official feed for this widget, and either can change or stop.",
   "binary": "bin/live-markets",
   "icon": "assets/icon.svg",
   "category": "finance",
@@ -34,7 +34,7 @@
     },
     "refresh_seconds": {
       "name": "Update every",
-      "description": "How often prices are fetched while a market is open",
+      "description": "How often CNBC is asked for prices while a market is open (Hyperliquid prices arrive by themselves)",
       "type": "integer",
       "min": 1,
       "max": 60,
@@ -42,6 +42,17 @@
       "unit": "s",
       "optional": true,
       "default_value": 2
+    },
+    "source": {
+      "name": "Prices from",
+      "description": "Hyperliquid prices round the clock; CNBC follows the US stock hours",
+      "type": "string",
+      "optional": true,
+      "default_value": "hyperliquid",
+      "enum_values": [
+        { "value": "hyperliquid", "label": "Hyperliquid (24/7, CNBC for what it lacks)" },
+        { "value": "cnbc", "label": "CNBC (US stock hours, pre-market and after hours)" }
+      ]
     }
   }
 }

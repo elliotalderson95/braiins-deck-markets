@@ -62,6 +62,10 @@ pub struct Quote {
     pub real_time: bool,
     /// Unix time of the last trade; 0 when the service gave none.
     pub traded_at: i64,
+    /// From Hyperliquid: a perpetual that trades round the clock. Its "previous close" is the price a day ago.
+    pub perp: bool,
+    /// The dollars traded in the last day, when the source says.
+    pub volume: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +74,7 @@ pub enum Tag {
     After,
     Closed,
     Delayed,
+    Perp,
 }
 
 /// The line under the price.
@@ -82,6 +87,8 @@ pub enum Note {
     /// The regular close and its move, under an after-hours price.
     Close { price: f64, pct: Option<f64> },
     NoPreMarketTrades,
+    /// The dollars traded in the last day.
+    Volume(f64),
 }
 
 /// What a tile shows.
@@ -102,6 +109,14 @@ impl Quote {
     /// trade leads and the day's own close and move sit under it.
     #[must_use]
     pub fn view(&self) -> View {
+        if self.perp {
+            return View {
+                price: self.last,
+                pct: self.day_pct,
+                tag: Some(Tag::Perp),
+                note: self.volume.map_or_else(|| self.prev_close.map_or(Note::None, Note::PrevClose), Note::Volume),
+            };
+        }
         let delayed = if self.real_time { None } else { Some(Tag::Delayed) };
         match self.session {
             Session::Regular => View {
@@ -181,6 +196,29 @@ impl Quote {
             ext,
             real_time: !raw.real_time.eq_ignore_ascii_case("false"),
             traded_at: unix_time(&raw.last_time).unwrap_or(0),
+            perp: false,
+            volume: None,
+        })
+    }
+
+    /// A Hyperliquid market's context as a quote: its mark price, against the price a day ago.
+    /// `None` when it carries no price.
+    #[must_use]
+    pub fn from_hl(coin: &str, ctx: &crate::hl::Ctx, now: i64) -> Option<Self> {
+        let last = number(&ctx.mark).or_else(|| number(&ctx.mid)).filter(|p| *p > 0.0)?;
+        let prev_close = number(&ctx.prev_day).filter(|p| *p > 0.0);
+        let name = if coin.contains(':') { coin.to_string() } else { [coin, " perpetual"].concat() };
+        Some(Self {
+            name,
+            session: Session::Regular,
+            last,
+            prev_close,
+            day_pct: against(last, prev_close),
+            ext: None,
+            real_time: true,
+            traded_at: now,
+            perp: true,
+            volume: number(&ctx.volume).filter(|v| *v > 0.0),
         })
     }
 }
@@ -410,5 +448,33 @@ mod tests {
         r.change_pct = String::new();
         let pct = Quote::from_raw(&r).expect("BUG: a good sample").day_pct.expect("BUG: worked out");
         assert!((pct - (348.75 / 342.56 - 1.0) * 100.0).abs() < 1e-9);
+    }
+
+    fn ctx(mark: &str, prev: &str, volume: &str) -> crate::hl::Ctx {
+        crate::hl::Ctx { mark: mark.into(), mid: String::new(), prev_day: prev.into(), volume: volume.into() }
+    }
+
+    #[test]
+    fn a_perpetual_shows_its_price_its_move_over_a_day_and_its_volume() {
+        let q = Quote::from_hl("xyz:NVDA", &ctx("163.43", "134.51", "1615050662.07"), 1_000).expect("BUG: a good context");
+        assert_eq!(q.session, Session::Regular);
+        assert_eq!(q.name, "xyz:NVDA");
+        let v = q.view();
+        assert!(close(v.price, 163.43));
+        assert!(close(v.pct.expect("BUG: a move"), (163.43 / 134.51 - 1.0) * 100.0));
+        assert_eq!(v.tag, Some(Tag::Perp));
+        assert_eq!(v.note, Note::Volume(1_615_050_662.07));
+        assert_eq!(Quote::from_hl("BTC", &ctx("60317.0", "61521.0", "4817910048.4"), 1).expect("BUG: a good context").name, "BTC perpetual");
+    }
+
+    #[test]
+    fn a_context_without_a_price_is_no_quote_and_the_mid_stands_in_for_a_missing_mark() {
+        assert_eq!(Quote::from_hl("BTC", &ctx("", "100", "1"), 1), None);
+        assert_eq!(Quote::from_hl("BTC", &ctx("0", "100", "1"), 1), None);
+        let mut c = ctx("", "100", "");
+        c.mid = "101.5".into();
+        let q = Quote::from_hl("BTC", &c, 1).expect("BUG: the mid is a price");
+        assert!(close(q.last, 101.5));
+        assert_eq!(q.view().note, Note::PrevClose(100.0), "no volume, so the old price is shown");
     }
 }

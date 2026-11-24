@@ -42,13 +42,15 @@ fn fixed(value: f64, decimals: u32) -> String {
     }
 }
 
-/// A price: two decimals, four under a dollar, none for coins in the tens of thousands.
+/// A price: two decimals, four under a dollar, six under a cent, none for coins in the tens of thousands.
 #[must_use]
 pub fn price(value: f64, kind: Kind) -> String {
     let abs = value.abs();
-    let decimals = if abs < 1.0 {
+    let decimals = if abs > 0.0 && abs < 0.01 {
+        6
+    } else if abs < 1.0 {
         4
-    } else if kind == Kind::Crypto && abs >= 10_000.0 {
+    } else if matches!(kind, Kind::Crypto | Kind::Perp) && abs >= 10_000.0 {
         0
     } else {
         2
@@ -57,6 +59,27 @@ pub fn price(value: f64, kind: Kind) -> String {
     if value < 0.0 {
         out.insert(0, '-');
     }
+    out
+}
+
+/// An amount in a few characters: "950", "5.4K", "482M", "1.6B", "2.3T".
+#[must_use]
+pub fn compact(value: f64) -> String {
+    let abs = value.abs();
+    let (scaled, suffix) = if abs >= 1e12 {
+        (abs / 1e12, "T")
+    } else if abs >= 1e9 {
+        (abs / 1e9, "B")
+    } else if abs >= 1e6 {
+        (abs / 1e6, "M")
+    } else if abs >= 1e3 {
+        (abs / 1e3, "K")
+    } else {
+        (abs, "")
+    };
+    let decimals = u32::from(!suffix.is_empty() && scaled < 10.0);
+    let mut out = magnitude(scaled, decimals);
+    out.push_str(suffix);
     out
 }
 
@@ -97,6 +120,26 @@ mod tests {
     #[test]
     fn prices_under_a_dollar_keep_four_decimals() {
         assert_eq!(price(0.4321, Kind::Stock), "0.4321");
+    }
+
+    #[test]
+    fn perpetuals_follow_the_same_rules_and_tiny_prices_keep_their_digits() {
+        assert_eq!(price(163.43, Kind::Perp), "163.43");
+        assert_eq!(price(60_317.0, Kind::Perp), "60,317");
+        assert_eq!(price(4_512.3, Kind::Perp), "4,512.30");
+        assert_eq!(price(0.0038, Kind::Perp), "0.003800");
+        assert_eq!(price(0.0, Kind::Perp), "0.0000");
+    }
+
+    #[test]
+    fn amounts_are_cut_to_a_few_characters() {
+        assert_eq!(compact(950.0), "950");
+        assert_eq!(compact(5_400.0), "5.4K");
+        assert_eq!(compact(12_500.0), "13K");
+        assert_eq!(compact(482_300_000.0), "482M");
+        assert_eq!(compact(1_615_050_662.0), "1.6B");
+        assert_eq!(compact(23_000_000_000.0), "23B");
+        assert_eq!(compact(2_300_000_000_000.0), "2.3T");
     }
 
     #[test]

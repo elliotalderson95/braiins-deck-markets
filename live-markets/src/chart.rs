@@ -228,9 +228,10 @@ pub fn nearest(line: &[(f32, f32)], x: f32) -> Option<usize> {
     })
 }
 
-/// When a point was: the time and the session for minutes, the date for days.
+/// When a point was: the time and the session for minutes, the date for days. The clock is the
+/// exchange's (New York) unless the series is a perpetual's, which has the Deck's own.
 #[must_use]
-pub fn point_label(point: &Point, frame: Frame) -> String {
+pub fn point_label(point: &Point, frame: Frame, kind: Kind) -> String {
     match frame {
         Frame::Day | Frame::Week => {
             let mut out = String::new();
@@ -239,7 +240,9 @@ pub fn point_label(point: &Point, frame: Frame) -> String {
                 out.push(' ');
             }
             out.push_str(&clock_label(point.local));
-            out.push_str(" ET");
+            if kind != Kind::Perp {
+                out.push_str(" ET");
+            }
             match point.phase {
                 Phase::Pre => out.push_str(", pre-market"),
                 Phase::Post => out.push_str(", after hours"),
@@ -329,7 +332,7 @@ fn parts(local: i64) -> Parts {
     }
 }
 
-fn push_int(out: &mut String, mut n: u64) {
+pub(crate) fn push_int(out: &mut String, mut n: u64) {
     let mut digits = [0_u8; 20];
     let mut len = 0;
     loop {
@@ -457,8 +460,8 @@ pub fn plot(points: &[Point], frame: Frame, kind: Kind, reference: Option<f64>, 
     // Labels along the bottom.
     let mut x_ticks = Vec::new();
     match frame {
-        Frame::Day => match session {
-            Some((from, to)) => {
+        Frame::Day => {
+            if let Some((from, to)) = session {
                 let marks: &[i64] = if kind == Kind::Stock {
                     &[PRE_OPEN, OPEN, 12 * HOUR, CLOSE, POST_CLOSE]
                 } else {
@@ -468,14 +471,17 @@ pub fn plot(points: &[Point], frame: Frame, kind: Kind, reference: Option<f64>, 
                     let at = (((day_start + m - from) as f64 / (to - from) as f64) * f64::from(w)) as f32;
                     x_ticks.push(Tick { at, label: clock_label(day_start + m) });
                 }
-            }
-            None => {
-                for k in 0..4_i64 {
-                    let local = first.local + (last.local - first.local) * k / 3;
-                    x_ticks.push(Tick { at: w * k as f32 / 3.0, label: clock_label(local) });
+            } else {
+                // Round the clock: a label at each round hour or few hours of the clock, where it falls.
+                let span = (last.local - first.local).max(1);
+                let step = [1, 2, 3, 6].into_iter().find(|h| span <= h * 5 * HOUR).unwrap_or(6) * HOUR;
+                let mut at = (first.local + step - 1).div_euclid(step) * step;
+                while at <= last.local && x_ticks.len() < 8 {
+                    x_ticks.push(Tick { at: ((at - first.local) as f64 / span as f64 * f64::from(w)) as f32, label: clock_label(at) });
+                    at += step;
                 }
             }
-        },
+        }
         Frame::Week => {
             let mut start = 0;
             for i in 1..=n {
@@ -665,8 +671,31 @@ mod tests {
     fn a_coin_has_no_bands_and_labels_by_its_own_clock() {
         let plot = plot(&day_series(Kind::Crypto), Frame::Day, Kind::Crypto, None, 1000.0, 200.0).expect("BUG: enough points");
         assert!(plot.bands.is_empty());
-        assert_eq!(plot.x_ticks.len(), 4);
+        // 04:00 to 19:00: a label every three hours, at round times.
+        let labels: Vec<&str> = plot.x_ticks.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["06:00", "09:00", "12:00", "15:00", "18:00"]);
+        assert!((plot.x_ticks[0].at - 1000.0 * 2.0 / 15.0).abs() < 0.5, "06:00 is two hours of fifteen along");
         assert!((plot.line[0].0 - 0.0).abs() < 0.5 && (plot.line[4].0 - 1000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_whole_day_round_the_clock_is_labelled_every_six_hours() {
+        // From 08:40 to 08:41 of the next day, as a perpetual's day is.
+        let start = 20_780 * DAY + 8 * HOUR + 40 * 60;
+        let points: Vec<Point> = (0..=288)
+            .map(|i| Point { ms: (start + i * 300) * 1_000, local: start + i * 300, close: 100.0 + i as f64 / 10.0, phase: Phase::Regular })
+            .collect();
+        let plot = plot(&points, Frame::Day, Kind::Perp, None, 1000.0, 200.0).expect("BUG: enough points");
+        let labels: Vec<&str> = plot.x_ticks.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["12:00", "18:00", "00:00", "06:00"]);
+        assert!(plot.bands.is_empty());
+        let short = &points[..12];
+        let plot = chart_plot_short(short);
+        assert!(!plot.x_ticks.is_empty(), "an hour of data still has a label");
+    }
+
+    fn chart_plot_short(points: &[Point]) -> Plot {
+        plot(points, Frame::Day, Kind::Perp, None, 1000.0, 200.0).expect("BUG: enough points")
     }
 
     #[test]
@@ -737,11 +766,15 @@ mod tests {
     fn a_point_is_named_by_its_time_or_its_date() {
         let day = 20_780 * DAY;
         let at = |secs: i64, phase| Point { ms: 0, local: day + secs, close: 1.0, phase };
-        assert_eq!(point_label(&at(9 * HOUR + 41 * 60, Phase::Regular), Frame::Day), "09:41 ET");
-        assert_eq!(point_label(&at(5 * HOUR, Phase::Pre), Frame::Day), "05:00 ET, pre-market");
-        assert_eq!(point_label(&at(17 * HOUR + 5 * 60, Phase::Post), Frame::Week), "Mon 17:05 ET, after hours");
-        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Month), "Nov 23");
-        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Year), "Nov 23, 2026");
-        assert_eq!(point_label(&at(0, Phase::Regular), Frame::FiveYears), "Nov 23, 2026");
+        let stock = Kind::Stock;
+        assert_eq!(point_label(&at(9 * HOUR + 41 * 60, Phase::Regular), Frame::Day, stock), "09:41 ET");
+        assert_eq!(point_label(&at(5 * HOUR, Phase::Pre), Frame::Day, stock), "05:00 ET, pre-market");
+        assert_eq!(point_label(&at(17 * HOUR + 5 * 60, Phase::Post), Frame::Week, stock), "Mon 17:05 ET, after hours");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Month, stock), "Nov 23");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::Year, stock), "Nov 23, 2026");
+        assert_eq!(point_label(&at(0, Phase::Regular), Frame::FiveYears, stock), "Nov 23, 2026");
+        // A perpetual's clock is the Deck's own, so it names no zone.
+        assert_eq!(point_label(&at(9 * HOUR + 41 * 60, Phase::Regular), Frame::Day, Kind::Perp), "09:41");
+        assert_eq!(point_label(&at(17 * HOUR + 5 * 60, Phase::Regular), Frame::Week, Kind::Perp), "Mon 17:05");
     }
 }

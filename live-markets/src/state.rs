@@ -1,8 +1,10 @@
 //! What the widget knows: the watchlist, the latest quote of each symbol, and how fresh they are.
 
 use crate::chart::{Frame, Series};
+use crate::clock;
+use crate::hl::{self, Ctx};
 use crate::quote::{Quote, Raw, Session};
-use crate::symbols::{Entry, Kind, request_list};
+use crate::symbols::{Entry, Kind, Source, request_list};
 use crate::view::{Hits, Tap, resolve};
 
 /// How long a price flashes green or red after it ticks.
@@ -35,6 +37,37 @@ pub struct Row {
     /// The service answered, and has no quote for this symbol.
     pub unknown: bool,
     pub tick: Option<Tick>,
+    /// The source the operator chose for the list.
+    pub prefer: Source,
+    /// Where this symbol's prices come from: that choice, unless the service has no market for it.
+    pub source: Source,
+    /// The Hyperliquid coin whose prices it shows.
+    pub coin: Option<String>,
+    /// The coins of `entry.hl` that Hyperliquid has no market for.
+    pub refused: Vec<String>,
+}
+
+impl Row {
+    #[must_use]
+    pub fn new(entry: Entry, prefer: Source) -> Self {
+        let source = if prefer == Source::Hyperliquid && !entry.hl.is_empty() { Source::Hyperliquid } else { Source::Cnbc };
+        Self { entry, quote: None, unknown: false, tick: None, prefer, source, coin: None, refused: Vec::new() }
+    }
+
+    /// What the symbol is on screen: a perpetual when Hyperliquid prices it, what CNBC calls it otherwise.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        let perp = match &self.quote {
+            Some(q) => q.perp,
+            None => self.source == Source::Hyperliquid,
+        };
+        if perp { Kind::Perp } else { self.entry.kind }
+    }
+
+    /// Whether CNBC is asked for this symbol: it is the symbol's source, or Hyperliquid has gone quiet.
+    fn asks_cnbc(&self, hl_down: bool) -> bool {
+        self.source == Source::Cnbc || hl_down
+    }
 }
 
 /// How fresh the data on screen is.
@@ -73,12 +106,15 @@ pub struct Detail {
     pub scrub: Option<Scrub>,
     /// `uptime_ms` of the last touch of the chart.
     pub scrub_ms: u64,
+    /// How many times loading the bars has failed: a symbol that Hyperliquid has not named yet is
+    /// tried under each of its names in turn.
+    pub attempt: usize,
 }
 
 impl Detail {
     #[must_use]
     pub fn new(row: usize, frame: Frame) -> Self {
-        Self { row, frame, series: None, failed: false, scrub: None, scrub_ms: 0 }
+        Self { row, frame, series: None, failed: false, scrub: None, scrub_ms: 0, attempt: 0 }
     }
 }
 
@@ -97,8 +133,8 @@ pub struct State {
     pub hits: Option<Hits>,
     /// `uptime_ms` of the last tap.
     pub touched_ms: u64,
-    /// The chart asked for in the request now in flight.
-    pub requested: Option<(String, Frame)>,
+    /// The chart asked for in the request now in flight: the symbol's query, what it was taken for, the frame.
+    pub requested: Option<(String, Kind, Frame)>,
     /// The arrow held down (-1 left, 1 right), and for how long.
     pub jog: Option<i8>,
     pub jog_ms: u64,
@@ -108,40 +144,168 @@ pub struct State {
     pub last_ok: i64,
     /// The poll cadence now, in milliseconds.
     pub interval_ms: u32,
+    /// `uptime_ms` when Hyperliquid last said anything, or when it was last asked to start.
+    pub hl_heard_ms: u64,
+    /// `uptime_ms` when the markets were last subscribed to.
+    pub hl_since_ms: u64,
+    /// Hyperliquid has said nothing for too long: CNBC prices its symbols meanwhile.
+    pub hl_down: bool,
 }
 
 impl State {
     /// Takes a new watchlist, keeping what is already known about symbols that stay.
-    /// A chart open on the old one is closed.
-    pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        self.screen = Screen::List;
+    /// A chart open on a symbol that is gone or has moved is closed. `prefer` is the source the operator chose.
+    pub fn set_entries(&mut self, entries: Vec<Entry>, prefer: Source) {
         let mut old = std::mem::take(&mut self.rows);
+        // A chart stays open when its symbol is still where it was, such as when only the cadence changed.
+        let open = match &self.screen {
+            Screen::Detail(d) => old.get(d.row).map(|r| (d.row, r.entry.clone(), r.prefer)),
+            Screen::List => None,
+        };
         self.rows = entries
             .into_iter()
-            .map(|entry| match old.iter().position(|r| r.entry.query == entry.query) {
-                Some(i) => Row { entry, ..old.swap_remove(i) },
-                None => Row { entry, quote: None, unknown: false, tick: None },
+            .map(|entry| {
+                let fresh = Row::new(entry, prefer);
+                match old.iter().position(|r| r.entry == fresh.entry && r.prefer == fresh.prefer) {
+                    Some(i) => old.swap_remove(i),
+                    None => fresh,
+                }
             })
             .collect();
+        let stays = open.is_some_and(|(row, entry, prefer)| self.rows.get(row).is_some_and(|r| r.entry == entry && r.prefer == prefer));
+        if !stays {
+            self.screen = Screen::List;
+        }
+        self.hl_down = false;
     }
 
-    /// The `symbols` part of the next request.
+    /// The `symbols` part of the next CNBC request: what it prices, which is everything while Hyperliquid is down.
     #[must_use]
     pub fn request_list(&self) -> String {
-        let entries: Vec<Entry> = self.rows.iter().map(|r| r.entry.clone()).collect();
+        let entries: Vec<Entry> = self.rows.iter().filter(|r| r.asks_cnbc(self.hl_down)).map(|r| r.entry.clone()).collect();
         request_list(&entries)
+    }
+
+    /// Whether CNBC has anything to price.
+    #[must_use]
+    pub fn needs_cnbc(&self) -> bool {
+        self.rows.iter().any(|r| r.asks_cnbc(self.hl_down))
+    }
+
+    /// Whether Hyperliquid has anything to price.
+    #[must_use]
+    pub fn wants_hl(&self) -> bool {
+        self.rows.iter().any(|r| r.source == Source::Hyperliquid)
+    }
+
+    /// The Hyperliquid coins to subscribe to: every name that its symbols may have there, once each.
+    #[must_use]
+    pub fn hl_coins(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for row in self.rows.iter().filter(|r| r.source == Source::Hyperliquid) {
+            for coin in row.entry.hl.iter().filter(|c| !row.refused.contains(c)) {
+                if !out.contains(coin) {
+                    out.push(coin.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The connection to Hyperliquid has just opened, and its markets are being subscribed to: it
+    /// has until `hl::SILENT_MS` to say something, and `hl::PATIENCE_MS` to price each symbol.
+    pub fn hl_expect(&mut self) {
+        self.hl_heard_ms = self.uptime_ms;
+        self.hl_since_ms = self.uptime_ms;
+        self.hl_down = false;
+    }
+
+    /// The connection to Hyperliquid could not be made. With none of its prices on screen to keep, CNBC
+    /// prices its symbols until it opens. Whether that changed who is asked.
+    pub fn hl_failed(&mut self) -> bool {
+        let down = self.hl_down || (self.wants_hl() && !self.on_hl());
+        std::mem::replace(&mut self.hl_down, down) != down
+    }
+
+    /// Hyperliquid said something, whatever it was.
+    pub fn hl_heard(&mut self) {
+        self.hl_heard_ms = self.uptime_ms;
+    }
+
+    /// A market's prices came in. Each symbol that may be this coin takes them, unless a coin that
+    /// ranks before it has answered. Whether any did.
+    pub fn apply_hl(&mut self, coin: &str, ctx: &Ctx, now: i64) -> bool {
+        let Some(quote) = Quote::from_hl(coin, ctx, now) else { return false };
+        let shown = quote.view().price;
+        let mut taken = false;
+        for row in self.rows.iter_mut().filter(|r| r.source == Source::Hyperliquid) {
+            let Some(rank) = row.entry.hl.iter().position(|c| c == coin) else { continue };
+            let held = row.coin.as_deref().and_then(|c| row.entry.hl.iter().position(|h| h == c));
+            if held.is_some_and(|have| have < rank) {
+                continue;
+            }
+            if let Some(before) = row.quote.as_ref().map(|q| q.view().price)
+                && (shown - before).abs() > f64::EPSILON {
+                    row.tick = Some(Tick { up: shown > before, at_ms: self.uptime_ms });
+                }
+            row.coin = Some(coin.to_string());
+            row.quote = Some(quote.clone());
+            row.unknown = false;
+            taken = true;
+        }
+        if taken {
+            self.last_ok = now;
+            self.hl_down = false;
+        }
+        taken
+    }
+
+    /// Hyperliquid has no market of this name. A symbol with no other name to try is asked of CNBC.
+    /// Whether one was.
+    pub fn refuse_hl(&mut self, coin: &str) -> bool {
+        let mut moved = false;
+        for row in self.rows.iter_mut().filter(|r| r.source == Source::Hyperliquid) {
+            if !row.entry.hl.iter().any(|c| c == coin) {
+                continue;
+            }
+            if !row.refused.iter().any(|c| c == coin) {
+                row.refused.push(coin.to_string());
+            }
+            if row.coin.is_none() && row.entry.hl.iter().all(|c| row.refused.contains(c)) {
+                row.source = Source::Cnbc;
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// Looks at how Hyperliquid is doing, about once a second. Silence for too long puts its symbols
+    /// on CNBC until it speaks again; a market it took in but never priced goes to CNBC for good.
+    /// Whether anything changed that the sources must be told of.
+    pub fn hl_watch(&mut self) -> bool {
+        let silent = self.uptime_ms.saturating_sub(self.hl_heard_ms) > hl::SILENT_MS;
+        let down = silent && self.wants_hl();
+        let mut changed = std::mem::replace(&mut self.hl_down, down) != down;
+        if !silent && self.uptime_ms.saturating_sub(self.hl_since_ms) > hl::PATIENCE_MS {
+            for row in self.rows.iter_mut().filter(|r| r.source == Source::Hyperliquid && r.quote.is_none()) {
+                row.source = Source::Cnbc;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Takes a reply: each symbol gets its quote, or is marked unknown. A price that changed
     /// leaves a tick behind for the screen to flash.
     pub fn apply(&mut self, replies: &[Raw], now: i64) {
-        for row in &mut self.rows {
+        let (hl_down, uptime) = (self.hl_down, self.uptime_ms);
+        for row in self.rows.iter_mut().filter(|r| r.asks_cnbc(hl_down)) {
             let raw = replies.iter().find(|r| r.symbol.eq_ignore_ascii_case(&row.entry.query));
             if let Some(quote) = raw.and_then(Quote::from_raw) {
                 let shown = quote.view().price;
                 if let Some(before) = row.quote.as_ref().map(|q| q.view().price)
                     && (shown - before).abs() > f64::EPSILON {
-                        row.tick = Some(Tick { up: shown > before, at_ms: self.uptime_ms });
+                        row.tick = Some(Tick { up: shown > before, at_ms: uptime });
                     }
                 row.quote = Some(quote);
                 row.unknown = false;
@@ -250,7 +414,17 @@ impl State {
     pub fn chart_target(&self) -> Option<(String, Kind, Frame)> {
         let Screen::Detail(d) = &self.screen else { return None };
         let row = self.rows.get(d.row)?;
-        Some((row.entry.query.clone(), row.entry.kind, d.frame))
+        Some((row.entry.query.clone(), row.kind(), d.frame))
+    }
+
+    /// The Hyperliquid coin to take the open chart's candles from: the one that prices the symbol, or
+    /// until one does, each name it may have there in turn.
+    #[must_use]
+    pub fn chart_coin(&self) -> Option<String> {
+        let Screen::Detail(d) = &self.screen else { return None };
+        let row = self.rows.get(d.row)?;
+        let names: Vec<&String> = row.entry.hl.iter().filter(|c| !row.refused.contains(c)).collect();
+        row.coin.clone().or_else(|| names.get(d.attempt % names.len().max(1)).map(|name| (*name).clone()))
     }
 
     /// Takes the bars that came back, if they are still the ones on show.
@@ -268,8 +442,9 @@ impl State {
     /// The bars for this symbol and frame could not be read.
     pub fn fail_chart(&mut self, query: &str, frame: Frame) {
         if let Screen::Detail(d) = &mut self.screen
-            && d.frame == frame && self.rows.get(d.row).is_some_and(|r| r.entry.query == query) && d.series.is_none() {
-                d.failed = true;
+            && d.frame == frame && self.rows.get(d.row).is_some_and(|r| r.entry.query == query) {
+                d.attempt += 1;
+                d.failed |= d.series.is_none();
             }
     }
 
@@ -279,20 +454,25 @@ impl State {
         idle && std::mem::take(&mut self.screen) != Screen::List
     }
 
-    /// Whether any symbol is trading now (pre-market, regular or after-hours).
+    /// Whether any symbol of CNBC's is trading now (pre-market, regular or after-hours): how often to ask it.
     #[must_use]
     pub fn any_trading(&self) -> bool {
-        self.rows.iter().filter_map(|r| r.quote.as_ref()).any(|q| q.session != Session::Closed)
+        self.rows.iter().filter_map(|r| r.quote.as_ref()).any(|q| !q.perp && q.session != Session::Closed)
     }
 
-    /// The session that leads the header: the first stock, index or future that has a quote.
+    /// The session that leads the header: that of the US stock market by the New York clock at `now`
+    /// (Unix seconds), when CNBC prices any stock or index. CNBC's own status field is no guide, and a
+    /// perpetual trades round the clock and has none.
     #[must_use]
-    pub fn market_session(&self) -> Option<Session> {
-        use crate::symbols::Kind;
-        self.rows
-            .iter()
-            .filter(|r| r.entry.kind != Kind::Crypto)
-            .find_map(|r| r.quote.as_ref().map(|q| q.session))
+    pub fn market_session(&self, now: i64) -> Option<Session> {
+        let priced = |r: &&Row| matches!(r.entry.kind, Kind::Stock | Kind::Index) && r.quote.as_ref().is_some_and(|q| !q.perp);
+        self.rows.iter().find(priced).map(|_| clock::us_session(now))
+    }
+
+    /// Whether any price on screen comes from Hyperliquid.
+    #[must_use]
+    pub fn on_hl(&self) -> bool {
+        self.rows.iter().any(|r| r.quote.as_ref().is_some_and(|q| q.perp))
     }
 
     #[must_use]
@@ -340,7 +520,7 @@ mod tests {
 
     fn state(symbols: &[&str]) -> State {
         let mut s = State { interval_ms: 2000, ..State::default() };
-        s.set_entries(resolve_all(symbols));
+        s.set_entries(resolve_all(symbols), Source::Cnbc);
         s
     }
 
@@ -387,7 +567,7 @@ mod tests {
     fn a_new_list_keeps_what_the_staying_symbols_knew() {
         let mut s = state(&["NVDA", "TSLA"]);
         s.apply(&[raw("NVDA", "167.29"), raw("TSLA", "389.63")], 1000);
-        s.set_entries(resolve_all(&["TSLA", "META"]));
+        s.set_entries(resolve_all(&["TSLA", "META"]), Source::Cnbc);
         assert_eq!(s.rows.len(), 2);
         assert!(s.rows[0].quote.is_some());
         assert!(s.rows[1].quote.is_none());
@@ -520,7 +700,7 @@ mod tests {
     fn a_new_watchlist_closes_the_chart() {
         let mut s = state(&["NVDA", "TSLA"]);
         s.screen = Screen::Detail(Detail::new(1, Frame::Day));
-        s.set_entries(resolve_all(&["NVDA"]));
+        s.set_entries(resolve_all(&["NVDA"]), Source::Cnbc);
         assert_eq!(s.screen, Screen::List);
     }
 
@@ -644,5 +824,202 @@ mod tests {
         s.jog(Some(-1), 16, 1200.0);
         assert_eq!(s.touched_ms, 40_000);
         assert!(matches!(&s.screen, Screen::Detail(d) if d.scrub_ms == 40_000));
+    }
+
+    // ── Hyperliquid ─────────────────────────────────────────────────
+
+    fn hl_state(symbols: &[&str]) -> State {
+        let mut s = State { interval_ms: 2000, ..State::default() };
+        s.set_entries(resolve_all(symbols), Source::Hyperliquid);
+        s
+    }
+
+    fn ctx(mark: &str) -> Ctx {
+        Ctx { mark: mark.into(), mid: String::new(), prev_day: "100".into(), volume: "1000000".into() }
+    }
+
+    #[test]
+    fn symbols_with_a_market_there_come_from_hyperliquid_and_the_rest_from_cnbc() {
+        let s = hl_state(&["NVDA", "BRK.B", "^DJI", "BTC-USD"]);
+        let sources: Vec<Source> = s.rows.iter().map(|r| r.source).collect();
+        assert_eq!(sources, [Source::Hyperliquid, Source::Cnbc, Source::Cnbc, Source::Hyperliquid]);
+        assert_eq!(s.request_list(), "BRK.B%7C.DJI");
+        assert_eq!(s.hl_coins(), ["NVDA", "xyz:NVDA", "BTC"]);
+        assert!(s.needs_cnbc() && s.wants_hl());
+    }
+
+    #[test]
+    fn the_cnbc_choice_leaves_nothing_to_hyperliquid() {
+        let mut s = State::default();
+        s.set_entries(resolve_all(&["NVDA", "BTC-USD"]), Source::Cnbc);
+        assert!(!s.wants_hl() && s.hl_coins().is_empty());
+        assert_eq!(s.request_list(), "NVDA%7CBTC.CM%3D");
+    }
+
+    #[test]
+    fn a_market_that_answers_gives_its_symbol_a_perpetual_quote_and_a_tick() {
+        let mut s = hl_state(&["NVDA"]);
+        s.uptime_ms = 4_000;
+        assert!(s.apply_hl("xyz:NVDA", &ctx("163.43"), 1_000));
+        assert_eq!(s.rows[0].coin.as_deref(), Some("xyz:NVDA"));
+        assert_eq!(s.rows[0].kind(), Kind::Perp);
+        assert_eq!((s.last_ok, s.rows[0].tick), (1_000, None));
+        s.uptime_ms = 5_000;
+        s.apply_hl("xyz:NVDA", &ctx("163.50"), 1_001);
+        assert_eq!(s.rows[0].tick, Some(Tick { up: true, at_ms: 5_000 }));
+    }
+
+    #[test]
+    fn a_name_that_ranks_first_wins_once_it_has_answered() {
+        let mut s = hl_state(&["NVDA"]);
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert_eq!(s.rows[0].coin.as_deref(), Some("xyz:NVDA"));
+        s.apply_hl("NVDA", &ctx("1.0"), 2);
+        assert_eq!(s.rows[0].coin.as_deref(), Some("NVDA"), "the main market's name ranks first");
+        s.apply_hl("xyz:NVDA", &ctx("163.1"), 3);
+        assert_eq!(s.rows[0].coin.as_deref(), Some("NVDA"), "and keeps the symbol");
+    }
+
+    #[test]
+    fn a_coin_nobody_listed_or_without_a_price_is_ignored() {
+        let mut s = hl_state(&["NVDA"]);
+        assert!(!s.apply_hl("xyz:TSLA", &ctx("1.0"), 1));
+        assert!(!s.apply_hl("xyz:NVDA", &Ctx::default(), 1));
+        assert!(s.rows[0].quote.is_none());
+        assert_eq!(s.last_ok, 0);
+    }
+
+    #[test]
+    fn a_symbol_whose_names_are_all_refused_falls_back_to_cnbc() {
+        let mut s = hl_state(&["JPM", "NVDA"]);
+        assert!(!s.refuse_hl("JPM"), "one name is not all of them");
+        assert_eq!(s.rows[0].source, Source::Hyperliquid);
+        assert!(s.refuse_hl("xyz:JPM"));
+        assert_eq!(s.rows[0].source, Source::Cnbc);
+        assert_eq!(s.request_list(), "JPM");
+        assert_eq!(s.hl_coins(), ["NVDA", "xyz:NVDA"]);
+        // NVDA is refused on the main market only, and answers on the builder's.
+        assert!(!s.refuse_hl("NVDA"));
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert_eq!(s.rows[1].source, Source::Hyperliquid);
+    }
+
+    #[test]
+    fn a_refusal_does_not_take_a_symbol_that_has_answered() {
+        let mut s = hl_state(&["NVDA"]);
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert!(!s.refuse_hl("NVDA") && !s.refuse_hl("xyz:NVDA"));
+        assert_eq!(s.rows[0].source, Source::Hyperliquid);
+    }
+
+    #[test]
+    fn silence_puts_cnbc_in_charge_until_hyperliquid_speaks_again() {
+        let mut s = hl_state(&["NVDA", "BRK.B"]);
+        s.hl_expect();
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        s.uptime_ms = hl::SILENT_MS;
+        assert!(!s.hl_watch(), "not yet");
+        assert_eq!(s.request_list(), "BRK.B");
+        s.uptime_ms += 1;
+        assert!(s.hl_watch());
+        assert_eq!(s.request_list(), "NVDA%7CBRK.B");
+        assert!(!s.hl_watch(), "nothing new");
+        s.hl_heard();
+        assert!(s.hl_watch());
+        assert_eq!(s.request_list(), "BRK.B");
+    }
+
+    #[test]
+    fn a_market_that_never_prices_goes_to_cnbc_after_a_while() {
+        let mut s = hl_state(&["NVDA", "TSLA"]);
+        s.hl_expect();
+        s.apply_hl("xyz:TSLA", &ctx("390.0"), 1);
+        s.uptime_ms = hl::PATIENCE_MS;
+        s.hl_heard();
+        assert!(!s.hl_watch());
+        s.uptime_ms += 1;
+        s.hl_heard();
+        assert!(s.hl_watch());
+        assert_eq!((s.rows[0].source, s.rows[1].source), (Source::Cnbc, Source::Hyperliquid));
+        assert_eq!(s.request_list(), "NVDA");
+    }
+
+    #[test]
+    fn a_perpetual_leaves_the_header_and_the_cnbc_cadence_alone() {
+        let mut s = hl_state(&["NVDA"]);
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert_eq!(s.market_session(1_795_000_000), None);
+        assert!(!s.any_trading());
+        assert!(s.on_hl());
+    }
+
+    #[test]
+    fn the_chart_of_a_perpetual_names_its_coin() {
+        let mut s = hl_state(&["NVDA"]);
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        assert_eq!(s.chart_target(), Some(("NVDA".to_string(), Kind::Perp, Frame::Day)));
+        assert_eq!(s.chart_coin().as_deref(), Some("NVDA"), "the first name, until one answers");
+        s.fail_chart("NVDA", Frame::Day);
+        assert_eq!(s.chart_coin().as_deref(), Some("xyz:NVDA"), "and then the next, if the first had no candles");
+        s.fail_chart("NVDA", Frame::Day);
+        assert_eq!(s.chart_coin().as_deref(), Some("NVDA"), "round again");
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert_eq!(s.chart_coin().as_deref(), Some("xyz:NVDA"), "a market that prices the symbol is the one");
+    }
+
+    #[test]
+    fn a_new_list_keeps_what_stays_and_forgets_a_changed_source() {
+        let mut s = hl_state(&["NVDA", "TSLA"]);
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        s.set_entries(resolve_all(&["NVDA", "META"]), Source::Hyperliquid);
+        assert!(s.rows[0].quote.is_some());
+        assert!(s.rows[1].quote.is_none());
+        s.set_entries(resolve_all(&["NVDA"]), Source::Cnbc);
+        assert!(s.rows[0].quote.is_none(), "another source, another price");
+    }
+
+    #[test]
+    fn a_connection_that_cannot_be_made_hands_the_symbols_to_cnbc_until_one_opens() {
+        let mut s = hl_state(&["NVDA", "BRK.B"]);
+        assert!(s.hl_failed());
+        assert_eq!(s.request_list(), "NVDA%7CBRK.B");
+        assert!(!s.hl_failed(), "already so");
+        s.hl_expect();
+        assert_eq!(s.request_list(), "BRK.B", "an open connection has its symbols back");
+    }
+
+    #[test]
+    fn prices_already_on_screen_are_kept_when_a_new_connection_fails() {
+        let mut s = hl_state(&["NVDA"]);
+        s.apply_hl("xyz:NVDA", &ctx("163.0"), 1);
+        assert!(!s.hl_failed());
+        assert!(!s.needs_cnbc());
+    }
+
+    #[test]
+    fn a_chart_stays_open_when_its_symbol_is_untouched_by_a_new_list() {
+        let mut s = hl_state(&["NVDA", "TSLA"]);
+        s.screen = Screen::Detail(Detail::new(1, Frame::Week));
+        s.set_entries(resolve_all(&["NVDA", "TSLA", "META"]), Source::Hyperliquid);
+        assert_eq!(s.screen, Screen::Detail(Detail::new(1, Frame::Week)), "TSLA is still second");
+        s.set_entries(resolve_all(&["TSLA", "NVDA"]), Source::Hyperliquid);
+        assert_eq!(s.screen, Screen::List, "it moved");
+        s.screen = Screen::Detail(Detail::new(0, Frame::Day));
+        s.set_entries(resolve_all(&["TSLA", "NVDA"]), Source::Cnbc);
+        assert_eq!(s.screen, Screen::List, "another source");
+    }
+
+    #[test]
+    fn the_header_session_follows_the_new_york_clock_for_stocks_priced_by_cnbc() {
+        let mut s = state(&["NVDA", "BTC-USD"]);
+        assert_eq!(s.market_session(1_795_000_000), None, "no quote yet");
+        s.apply(&[raw("NVDA", "167.29")], 1000);
+        for now in [1_795_000_000, 1_795_040_000, 1_795_100_000] {
+            assert_eq!(s.market_session(now), Some(clock::us_session(now)));
+        }
+        // Coins alone have no stock market to name.
+        let mut coins = state(&["BTC-USD"]);
+        coins.apply(&[raw("BTC.CM=", "60000")], 1000);
+        assert_eq!(coins.market_session(1_795_000_000), None);
     }
 }

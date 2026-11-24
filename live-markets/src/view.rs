@@ -23,6 +23,7 @@ const UP: Color = Color::from_hex(0x2F_D1_7C);
 const DOWN: Color = Color::from_hex(0xFF_5C_62);
 const AMBER: Color = Color::from_hex(0xF6_A8_2B);
 const VIOLET: Color = Color::from_hex(0xA2_93_FF);
+const SKY: Color = Color::from_hex(0x4F_B7_F0);
 
 const HEADER_H: f32 = 52.0;
 const MIN_CELL_W: f32 = 270.0;
@@ -331,6 +332,7 @@ fn tag_style(tag: Tag) -> (&'static str, Color) {
         Tag::After => ("AFTER", VIOLET),
         Tag::Closed => ("CLOSED", MUTE),
         Tag::Delayed => ("DELAYED", MUTE),
+        Tag::Perp => ("PERP", SKY),
     }
 }
 
@@ -360,6 +362,7 @@ fn note_text(note: Note, kind: Kind, wide: bool) -> Option<(String, Color)> {
         Note::NoPreMarketTrades => Some(("No pre-market trades".to_string(), MUTE)),
         Note::PrevClose(p) => Some((join(&["Prev ", &format::price(p, kind)]), MUTE)),
         Note::PreMarket(pct) => pct.map(|p| (join(&[if wide { "Pre-market " } else { "Pre " }, &format::percent(p)]), tone(p))),
+        Note::Volume(v) => Some((join(&["Vol $", &format::compact(v)]), MUTE)),
         Note::Close { price, pct } => {
             let mut s = join(&["Close ", &format::price(price, kind)]);
             if let Some(p) = pct {
@@ -378,7 +381,7 @@ fn join(parts: &[&str]) -> String {
 /// The company's name as the service writes it; for coins the part before the slash ("Bitcoin/USD ...").
 fn display_name(item: &Row) -> Option<String> {
     let name = item.quote.as_ref()?.name.as_str();
-    let name = if item.entry.kind == Kind::Crypto { name.split('/').next().unwrap_or(name) } else { name };
+    let name = if item.kind() == Kind::Crypto { name.split('/').next().unwrap_or(name) } else { name };
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -412,11 +415,11 @@ fn cell(item: &Row, b: Band, cw: f32, ch: f32, now_ms: u64, fade: bool) -> Node 
     match (&view, item.unknown) {
         (Some(v), _) => {
             middle.push(text(
-                format::price(v.price, item.entry.kind),
+                format::price(v.price, item.kind()),
                 style!(size: b.price, weight: FontWeight::BOLD, color: shade(price_color, fade), align: TextAlign::Right, width: b.price_w),
             ));
             if b.two_lines
-                && let Some((line, color)) = note_text(v.note, item.entry.kind, b.wide) {
+                && let Some((line, color)) = note_text(v.note, item.kind(), b.wide) {
                     middle.push(text(
                         line,
                         style!(size: b.note, color: shade(color, fade), align: TextAlign::Right, width: b.price_w, text_overflow: TextOverflow::Ellipsis),
@@ -462,7 +465,7 @@ fn clock(ts: i64) -> String {
 }
 
 fn header(width: f32, state: &State, now: i64) -> Node {
-    let (market, market_color) = match state.market_session() {
+    let (market, market_color) = match state.market_session(now) {
         Some(Session::Regular) => ("Market open", UP),
         Some(Session::Pre) => ("Pre-market", AMBER),
         Some(Session::Post) => ("After hours", VIOLET),
@@ -476,10 +479,18 @@ fn header(width: f32, state: &State, now: i64) -> Node {
         Health::Offline => (DOWN, join(&["Offline, last update ", &clock(state.last_ok)])),
     };
     let mut title = vec![text("Live Markets", style!(size: 22, weight: FontWeight::SEMIBOLD, color: INK))];
+    let mut chips = Vec::new();
     if !market.is_empty() {
+        chips.push((market, market_color));
+    }
+    // Perpetuals trade round the clock: say where they come from.
+    if state.on_hl() {
+        chips.push(("Hyperliquid 24/7", SKY));
+    }
+    for (label, color) in chips {
         title.push(row(
-            props!(background: market_color.with_alpha(0.16), border_radius: 8.0, padding: 5.0, cross_align: CrossAlign::Center),
-            [text(market, style!(size: 15, weight: FontWeight::SEMIBOLD, color: market_color))],
+            props!(background: color.with_alpha(0.16), border_radius: 8.0, padding: 5.0, cross_align: CrossAlign::Center),
+            [text(label, style!(size: 15, weight: FontWeight::SEMIBOLD, color: color))],
         ));
     }
     row(
@@ -694,7 +705,7 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
     let (wf, hf) = (w as f32, h as f32);
     let mut layout = detail_layout(wf, hf);
     let item = &state.rows[d.row];
-    let kind = item.entry.kind;
+    let kind = item.kind();
     let view = item.quote.as_ref().map(Quote::view);
     let class = layout.class;
     let compact = class == DetailClass::Compact;
@@ -729,7 +740,7 @@ fn detail_screen(state: &State, d: &Detail, w: u32, h: u32, now: i64) -> (Node, 
         let i = chart::nearest(&p.line, x)?;
         Some((i, *points.as_ref()?.get(i)?))
     });
-    let scrub_label = scrub.map(|(_, p)| chart::point_label(&p, d.frame));
+    let scrub_label = scrub.map(|(_, p)| chart::point_label(&p, d.frame, kind));
     let cursor = scrub.map(|(i, _)| i).zip(scrub_label.as_deref());
     let draws = match (&plot, d.failed) {
         (Some(p), _) => chart_draws(p, kind, rect.w, rect.h, axis_w, label_h, label_size, cursor),
@@ -1014,10 +1025,10 @@ mod tests {
     #[test]
     fn every_screen_builds_at_every_size_with_a_finger_on_the_chart() {
         use crate::chart::{RawBar, Series};
-        use crate::symbols::resolve_all;
+        use crate::symbols::{Source, resolve_all};
 
         let mut state = State { interval_ms: 2_000, ..State::default() };
-        state.set_entries(resolve_all(&["NVDA", "TSLA"]));
+        state.set_entries(resolve_all(&["NVDA", "TSLA"]), Source::Cnbc);
         let bars: Vec<RawBar> = (0..120)
             .map(|i| RawBar { ms: i * 60_000, local: 20_780 * 86_400 + 4 * 3_600 + i * 60, close: 100.0 + (i as f64 / 7.0).sin() })
             .collect();
@@ -1046,5 +1057,43 @@ mod tests {
         let hits = Hits::Detail(l);
         assert_eq!(resolve(&hits, live.x + 10.0, live.y + 10.0), Tap::Live);
         assert_eq!(resolve(&hits, 5.0, 5.0), Tap::Nothing);
+    }
+
+    #[test]
+    fn a_perpetual_builds_at_every_size_with_its_tag_volume_and_a_finger_on_the_chart() {
+        use crate::chart::{RawBar, Series};
+        use crate::hl::Ctx;
+        use crate::symbols::{Source, resolve_all};
+
+        let mut state = State { interval_ms: 2_000, ..State::default() };
+        state.set_entries(resolve_all(&["NVDA", "BTC-USD", "JPM"]), Source::Hyperliquid);
+        let ctx = Ctx { mark: "163.43".into(), mid: String::new(), prev_day: "134.51".into(), volume: "1615050662.07".into() };
+        assert!(state.apply_hl("xyz:NVDA", &ctx, 1_000));
+        assert_eq!(state.rows[0].kind(), Kind::Perp);
+        let bars: Vec<RawBar> = (0..120)
+            .map(|i| RawBar { ms: i * 300_000, local: 20_780 * 86_400 + i * 300, close: 160.0 + (i as f64 / 7.0).sin() })
+            .collect();
+        for frame in Frame::ALL {
+            for (w, h) in [(1280, 480), (638, 480), (638, 238), (317, 238)] {
+                for finger in [None, Some(Scrub::Px(123.0)), Some(Scrub::Fraction(0.5))] {
+                    let mut detail = Detail::new(0, frame);
+                    detail.series = Some(Series::from_bars(frame, Kind::Perp, &bars));
+                    detail.scrub = finger;
+                    state.screen = Screen::Detail(detail);
+                    let (_, hits) = screen(&state, w, h, 1_000);
+                    assert!(matches!(hits, Hits::Detail(_)), "{frame:?} {w}x{h}");
+                }
+                state.screen = Screen::List;
+                let (_, hits) = screen(&state, w, h, 1_000);
+                assert!(matches!(hits, Hits::List { .. }), "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_perpetual_tag_and_the_volume_note_read_well() {
+        assert_eq!(tag_style(Tag::Perp).0, "PERP");
+        let (line, _) = note_text(Note::Volume(1_615_050_662.0), Kind::Perp, true).expect("BUG: a volume has a line");
+        assert_eq!(line, "Vol $1.6B");
     }
 }
